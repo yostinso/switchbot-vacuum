@@ -622,6 +622,20 @@ class CoordinatorTests(unittest.IsolatedAsyncioTestCase):
         coordinator._persist_rooms.assert_called_once()
         self.assertEqual(coordinator.map_data["attributes"]["source"], "SwitchBot K10+ cloud map")
         self.assertEqual(coordinator.k10_map_summary["source"], "current")
+        self.assertIsNotNone(coordinator.map_refreshed_at)
+        self.assertIsNone(coordinator.k10_last_error)
+
+    async def test_render_failure_is_explained(self):
+        coordinator = fake_coordinator()
+        record = k10_map_record()
+        record["map"] = "not base64!!"
+        client = MagicMock(map_record_count=1, map_source="current")
+        client.get_map = AsyncMock(return_value=(record, {}))
+        coordinator._authorize_k10_api = AsyncMock(return_value=client)
+        coordinator._persist_rooms = MagicMock()
+        await coordinator.async_refresh_k10_rooms()
+        self.assertIsNone(coordinator.map_refreshed_at)
+        self.assertTrue(coordinator.k10_last_error.startswith("Map could not be rendered"))
 
     async def test_protocol_error_is_recorded(self):
         coordinator = fake_coordinator()
@@ -650,6 +664,8 @@ class CoordinatorTests(unittest.IsolatedAsyncioTestCase):
         client.get_clean_track = AsyncMock(return_value=([a, b], 2))
         await coordinator._async_update_k10_track(6)  # docked: initial full load
         self.assertEqual(coordinator._k10_path, [tuple(a), tuple(b)])
+        first_update = coordinator.path_updated_at
+        self.assertIsNotNone(first_update)
         await coordinator._async_update_k10_track(6)  # docked and loaded: no fetch
         self.assertEqual(client.get_clean_track.await_count, 1)
         client.get_clean_track = AsyncMock(return_value=([c], 3))

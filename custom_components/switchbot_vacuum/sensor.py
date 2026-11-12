@@ -97,6 +97,13 @@ async def async_setup_entry(
             SwitchBotCleanSummarySensor(coordinator, desc)
             for desc in CLEAN_SUMMARY_SENSORS
         )
+    if device_type == DEVICE_TYPE_K10:
+        entities += [
+            SwitchBotUpdateTimeSensor(coordinator, "last_map_refresh", "Last map refresh",
+                                      "map_refreshed_at", "mdi:map-clock"),
+            SwitchBotUpdateTimeSensor(coordinator, "last_path_update", "Last path update",
+                                      "path_updated_at", "mdi:map-marker-path"),
+        ]
 
     async_add_entities(entities)
     _async_hide_existing_room_sensors(hass, entry)
@@ -122,6 +129,36 @@ async def async_setup_entry(
 
 
 ROOM_SENSORS_HIDDEN = "room_sensors_hidden"
+
+
+class SwitchBotUpdateTimeSensor(CoordinatorEntity[SwitchBotS10Coordinator], SensorEntity):
+    """When HA last refreshed the map, or last received new cleaning-path points."""
+
+    _attr_device_class = SensorDeviceClass.TIMESTAMP
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_has_entity_name = True
+
+    def __init__(
+        self, coordinator: SwitchBotS10Coordinator, key: str, name: str, attribute: str,
+        icon: str,
+    ) -> None:
+        super().__init__(coordinator)
+        self._attribute = attribute
+        self._attr_name = name
+        self._attr_icon = icon
+        self._attr_unique_id = f"{coordinator.device_mac}_{key}"
+        self._attr_device_info = DeviceInfo(identifiers={(DOMAIN, coordinator.device_mac)})
+
+    @property
+    def native_value(self):
+        return getattr(self.coordinator, self._attribute, None)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, str | None] | None:
+        """Explain a stale map refresh with the last failure (fixed messages only)."""
+        if self._attribute != "map_refreshed_at":
+            return None
+        return {"last_error": getattr(self.coordinator, "k10_last_error", None)}
 
 
 @callback

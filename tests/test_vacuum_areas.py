@@ -154,3 +154,43 @@ class RoomSensorVisibilityTests(unittest.TestCase):
         registry, hass = self.run_migration({"room_sensors_hidden": True})
         registry.async_update_entity.assert_not_called()
         hass.config_entries.async_update_entry.assert_not_called()
+
+
+class UpdateTimeSensorTests(unittest.TestCase):
+    def setup_entities(self, device_type):
+        from custom_components.switchbot_vacuum import sensor
+
+        c = coordinator(device_type)
+        added = []
+        hass = MagicMock()
+        hass.data = {"switchbot_vacuum": {"e": c}}
+        entry = SimpleNamespace(entry_id="e", data={"device_type": device_type},
+                                options={"room_sensors_hidden": True},
+                                async_on_unload=MagicMock())
+        import asyncio
+
+        asyncio.run(sensor.async_setup_entry(hass, entry, lambda e: added.extend(e)))
+        return c, {e.name: e for e in added if isinstance(e, sensor.SwitchBotUpdateTimeSensor)}
+
+    def test_k10_has_refresh_and_path_sensors(self):
+        from datetime import datetime, timezone
+
+        from homeassistant.const import EntityCategory
+
+        c, sensors = self.setup_entities(DEVICE_TYPE_K10)
+        self.assertEqual(set(sensors), {"Last map refresh", "Last path update"})
+        when = datetime(2026, 11, 11, tzinfo=timezone.utc)
+        c.map_refreshed_at, c.path_updated_at = when, None
+        c.k10_last_error = "No usable map package was found"
+        refresh, path = sensors["Last map refresh"], sensors["Last path update"]
+        self.assertEqual(refresh.native_value, when)
+        self.assertIsNone(path.native_value)
+        self.assertEqual(refresh.extra_state_attributes,
+                         {"last_error": "No usable map package was found"})
+        self.assertIsNone(path.extra_state_attributes)
+        self.assertEqual(refresh.entity_category, EntityCategory.DIAGNOSTIC)
+
+    def test_other_models_do_not_get_them(self):
+        for device_type in (DEVICE_TYPE_S10, DEVICE_TYPE_K10PRO):
+            _, sensors = self.setup_entities(device_type)
+            self.assertEqual(sensors, {}, device_type)

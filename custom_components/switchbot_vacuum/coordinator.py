@@ -183,6 +183,9 @@ class SwitchBotS10Coordinator(DataUpdateCoordinator):
     _k10_path_drawn = -1
     _k10_track_index = 0
     _k10_track_loaded = False
+    # When HA last fetched and rendered the map / last received new path points.
+    map_refreshed_at: datetime | None = None
+    path_updated_at: datetime | None = None
 
     def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
         """Initialize."""
@@ -519,8 +522,14 @@ class SwitchBotS10Coordinator(DataUpdateCoordinator):
             if rendered is not None:
                 self.map_data = rendered
                 self.map_updated = datetime.now().astimezone()
+                self.map_refreshed_at = self.map_updated
                 self._k10_pose, self._k10_path_drawn = None, -1
                 self._k10_track_loaded = False  # Reload the track for the new map.
+            else:
+                self.k10_last_error = (
+                    f"Map could not be rendered ({self.k10_map_summary.get('render_error')})"
+                )
+            if rendered is not None:
                 _LOGGER.info(
                     "Rendered K10+ map (%s rooms, fit %s)", len(rendered["rooms"]),
                     rendered["attributes"]["coordinate_fit"],
@@ -908,7 +917,10 @@ class SwitchBotS10Coordinator(DataUpdateCoordinator):
             _LOGGER.debug("K10+ cleaning track unavailable (%s)", type(exc).__name__)
             return
         new_points = parse_path(points)
-        self._k10_path = (self._k10_path if start else []) + new_points
+        path = (self._k10_path if start else []) + new_points
+        if path != self._k10_path:
+            self.path_updated_at = datetime.now().astimezone()
+        self._k10_path = path
         self._k10_track_index = start + len(points)
         self._k10_track_loaded = True
 
