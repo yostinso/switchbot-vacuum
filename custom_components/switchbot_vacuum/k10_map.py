@@ -26,24 +26,24 @@ MAX_IMAGE_EDGE = 1600
 MARGIN_CELLS = 3
 # The SwitchBot app shows K10+ maps rotated 180° relative to the raw grid (verified on hardware).
 ROTATION = 180
-UNKNOWN = 0
-
-C_FLOOR = (236, 240, 245, 255)
-C_WALL = (52, 64, 84, 255)
-C_UNKNOWN = (0, 0, 0, 0)
+C_FLOOR = (200, 204, 212, 255)  # Floor not assigned to any room.
+C_WALL = (66, 60, 100, 255)  # Walls and obstacles.
+C_UNKNOWN = (0, 0, 0, 0)  # Unexplored: transparent.
 C_NOGO = (224, 74, 74)
 C_DOCK = (30, 120, 210)
 C_ROBOT = (235, 126, 24)
-C_PATH = (46, 160, 90, 200)  # RGBA; alpha is the blend weight over the floor.
+C_PATH = (255, 255, 255, 220)  # RGBA; alpha is the blend weight.
+C_LABEL_BG = (44, 46, 62, 165)
+# Saturated, app-like room colours; red is left for no-go zones.
 ROOM_COLORS = (
-    (192, 217, 246),
-    (225, 206, 241),
-    (180, 225, 224),
-    (249, 218, 181),
-    (211, 225, 177),
-    (242, 201, 213),
-    (215, 213, 247),
-    (246, 232, 170),
+    (126, 186, 240),
+    (246, 168, 92),
+    (150, 146, 232),
+    (244, 196, 112),
+    (110, 212, 178),
+    (236, 136, 112),
+    (100, 160, 228),
+    (196, 150, 220),
 )
 
 # (vertex units per grid unit, label). Grid origin/resolution are used as given.
@@ -250,6 +250,77 @@ def _disc(rows, width, height, x, y, radius, color, ring=None):
                 row[xx * 4 : xx * 4 + 4] = bytes((*rgb, 255))
 
 
+def _classify_grid(grid: bytes, width: int, height: int) -> tuple[int, int | None]:
+    """Return (background, floor) cell values; everything else is wall/obstacle.
+
+    Robots disagree on the encoding (K10+: 127 unexplored, 255 floor, 0 walls;
+    other 360 models: 0 unexplored, 127 floor, 255 walls). The value filling the
+    grid's outer border is unexplored space; the commoner remaining value is floor.
+    """
+    border = Counter(grid[:width]) + Counter(grid[(height - 1) * width :])
+    for r in range(1, height - 1):
+        border[grid[r * width]] += 1
+        border[grid[r * width + width - 1]] += 1
+    background = border.most_common(1)[0][0]
+    others = Counter(grid)
+    del others[background]
+    return background, (others.most_common(1)[0][0] if others else None)
+
+
+def _stroke(rows, width, height, segments, rgba, half) -> None:
+    """Blend line segments (pixel coordinates) of half-width ``half`` onto rows."""
+    painted: set[tuple[int, int]] = set()
+    for (x0, y0), (x1, y1) in segments:
+        steps = max(1, int(math.hypot(x1 - x0, y1 - y0) * 2))
+        for i in range(steps + 1):
+            x = x0 + (x1 - x0) * i / steps
+            y = y0 + (y1 - y0) * i / steps
+            for yy in range(int(y - half), int(y + half) + 1):
+                for xx in range(int(x - half), int(x + half) + 1):
+                    if 0 <= xx < width and 0 <= yy < height:
+                        painted.add((xx, yy))
+    r, g, b, a = rgba
+    for xx, yy in painted:
+        px = rows[yy][xx * 4 : xx * 4 + 4]
+        if px[3]:
+            rows[yy][xx * 4 : xx * 4 + 4] = bytes((
+                (px[0] * (255 - a) + r * a) // 255,
+                (px[1] * (255 - a) + g * a) // 255,
+                (px[2] * (255 - a) + b * a) // 255,
+                255,
+            ))
+        else:
+            rows[yy][xx * 4 : xx * 4 + 4] = bytes((r, g, b, a))
+
+
+def _draw_labels(rows, width, height, labels, scale) -> list:
+    """Room names in rounded pills, like the app; skipped if Pillow is unavailable."""
+    if not labels:
+        return rows
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+    except ImportError:
+        return rows
+    image = Image.frombytes("RGBA", (width, height), b"".join(bytes(r) for r in rows))
+    overlay = Image.new("RGBA", image.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+    try:
+        font = ImageFont.load_default(size=max(10, scale * 5))
+    except TypeError:  # Pillow < 10.1 has no scalable default font.
+        font = ImageFont.load_default()
+    pad = max(2, scale)
+    for text, x, y in labels:
+        left, top, right, bottom = draw.textbbox((x, y), text, font=font, anchor="mm")
+        draw.rounded_rectangle(
+            (left - pad * 2, top - pad, right + pad * 2, bottom + pad),
+            radius=(bottom - top) // 2 + pad, fill=C_LABEL_BG,
+        )
+        draw.text((x, y), text, font=font, fill=(255, 255, 255, 255), anchor="mm")
+    data = Image.alpha_composite(image, overlay).tobytes()
+    stride = width * 4
+    return [bytearray(data[i * stride : (i + 1) * stride]) for i in range(height)]
+
+
 def decode_k10_map(map_data: dict[str, Any]) -> dict[str, Any]:
     """Return rooms, geometry and a rendered PNG for a K10+ map record."""
     area = _smart_area(map_data)
@@ -272,15 +343,24 @@ def decode_k10_map(map_data: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("Invalid map transform")
     factor, hypothesis, fit = _choose_factor(rooms, dock, x_min, y_min, res, width, height)
 
+    background, floor_value = _classify_grid(grid, width, height)
+
     # Crop to known cells (image rows are top-origin; grid row 0 is the bottom).
     cols, rows_known = [], []
     for r in range(height):
         line = grid[r * width : (r + 1) * width]
-        if line.count(UNKNOWN) != width:
+        if line.count(background) != width:
             rows_known.append(height - 1 - r)
-            first = next(i for i, v in enumerate(line) if v != UNKNOWN)
-            last = width - 1 - next(i for i, v in enumerate(reversed(line)) if v != UNKNOWN)
+            first = next(i for i, v in enumerate(line) if v != background)
+            last = width - 1 - next(i for i, v in enumerate(reversed(line)) if v != background)
             cols += (first, last)
+    # No-go zones may extend over unexplored space; keep them whole, as the app does.
+    for zone in map_data.get("area") or []:
+        for x, y in _points(zone.get("vertexs")) if isinstance(zone, dict) else []:
+            cx, cy = (x / factor - x_min) / res, (y / factor - y_min) / res
+            if 0 <= cx < width and 0 <= cy < height:
+                cols.append(int(cx))
+                rows_known.append(height - 1 - int(cy))
     if not cols:
         left, top, right, bottom = 0, 0, width - 1, height - 1
     else:
@@ -301,13 +381,13 @@ def decode_k10_map(map_data: dict[str, Any]) -> dict[str, Any]:
         source = (height - 1 - (top + row)) * width
         line = grid[source + left : source + left + cw]
         for col, value in enumerate(line):
-            if value == UNKNOWN:
+            if value == background:
                 continue
-            if value >= 200:
-                cells[row][col] = C_WALL
-            else:
+            if value == floor_value:
                 cells[row][col] = C_FLOOR
                 floor[row][col] = True
+            else:
+                cells[row][col] = C_WALL
 
     crop_cell = frame.crop
 
@@ -317,6 +397,7 @@ def decode_k10_map(map_data: dict[str, Any]) -> dict[str, Any]:
 
     geometry = {}
     room_stats = []
+    labels: list[tuple[str, float, float]] = []
     for index, room in enumerate(rooms):
         if len(room["vertexs"]) < 3:
             room_stats.append({"vertices": len(room["vertexs"]), "skipped": True})
@@ -340,10 +421,15 @@ def decode_k10_map(map_data: dict[str, Any]) -> dict[str, Any]:
             "cells_coloured": len(interior),
             "grid_values_inside": {str(v): c for v, c in under.most_common(5)},
         })
-        cx = sum(p[0] for p in polygon) / len(polygon)
-        cy = sum(p[1] for p in polygon) / len(polygon)
-        if interior:  # Label on a cleaned cell nearest the vertex centroid.
+        if interior:
+            # Centre of the room's floor, snapped onto its floor for L/U shapes.
+            cx = sum(p[0] for p in interior) / len(interior)
+            cy = sum(p[1] for p in interior) / len(interior)
             cx, cy = min(interior, key=lambda p: (p[0] - cx) ** 2 + (p[1] - cy) ** 2)
+        else:
+            cx = sum(p[0] for p in polygon) / len(polygon)
+            cy = sum(p[1] for p in polygon) / len(polygon)
+        labels.append((room["name"], *frame.to_pixel(cx, cy)))
         geometry[f"room{room['id']}"] = {
             "name": room["name"],
             "outline": [to_pixel(x, y) for x, y in polygon],
@@ -352,6 +438,7 @@ def decode_k10_map(map_data: dict[str, Any]) -> dict[str, Any]:
             "y": to_pixel(cx, cy)[1],
         }
 
+    zone_outlines = []
     for zone in map_data.get("area") or []:
         vertexs = _points(zone.get("vertexs")) if isinstance(zone, dict) else []
         if len(vertexs) >= 3:
@@ -361,6 +448,10 @@ def decode_k10_map(map_data: dict[str, Any]) -> dict[str, Any]:
                     cells[row][col] = tuple(
                         (b * 3 + n * 2) // 5 for b, n in zip(base[:3], C_NOGO)
                     ) + (255,)
+                else:  # Zones may extend over unexplored space, as in the app.
+                    cells[row][col] = (*C_NOGO, 90)
+            outline = [frame.pixel(x, y) for x, y in vertexs]
+            zone_outlines += list(zip(outline, outline[1:] + outline[:1]))
 
     image_w, image_h = frame.image_w, frame.image_h
     pixel_rows = []
@@ -368,6 +459,7 @@ def decode_k10_map(map_data: dict[str, Any]) -> dict[str, Any]:
         row = row[::-1] if ROTATION == 180 else row
         expanded = b"".join(bytes(c) * scale for c in row)
         pixel_rows.extend(bytearray(expanded) for _ in range(scale))
+    _stroke(pixel_rows, image_w, image_h, zone_outlines, (*C_NOGO, 255), max(0.5, scale / 4))
 
     charger = None
     if dock:
@@ -376,7 +468,9 @@ def decode_k10_map(map_data: dict[str, Any]) -> dict[str, Any]:
             _disc(pixel_rows, image_w, image_h, px, py, max(5, scale * 2), C_DOCK, (255, 255, 255))
             charger = {"x": round(px, 1), "y": round(py, 1)}
 
-    base_image = _png_rgba(image_w, image_h, pixel_rows)
+    base_image = _png_rgba(
+        image_w, image_h, _draw_labels(pixel_rows, image_w, image_h, labels, scale)
+    )
     attributes = {
         "map_id": str(map_data.get("mapId", area.get("mapId", ""))),
         "rooms": geometry,
@@ -397,7 +491,12 @@ def decode_k10_map(map_data: dict[str, Any]) -> dict[str, Any]:
         "_base_image": base_image,
         "_render_rows": [bytes(r) for r in pixel_rows],
         "_frame": frame.as_tuple(),
-        "_room_stats": {"crop_size": [cw, ch], "rooms": room_stats},
+        "_labels": labels,
+        "_room_stats": {
+            "crop_size": [cw, ch],
+            "grid_classes": {"background": background, "floor": floor_value},
+            "rooms": room_stats,
+        },
         "rooms": room_names,
         "image": base_image,
         "attributes": attributes,
@@ -438,36 +537,14 @@ def parse_path(value: Any) -> list[tuple[float, float]]:
 
 def _draw_path(rows, frame: _Frame, path: list[tuple[float, float]]) -> int:
     """Blend the cleaning path onto the pixels; return the number of segments drawn."""
-    width, height = frame.image_w, frame.image_h
-    half = max(0.5, frame.scale / 4)
     max_jump = 1.0 * frame.factor  # Skip gaps over 1 m (relocalisation, missing samples).
-    drawn = 0
-    painted: set[tuple[int, int]] = set()
-    for (ax, ay), (bx, by) in zip(path, path[1:]):
-        if math.hypot(bx - ax, by - ay) > max_jump:
-            continue
-        x0, y0 = frame.pixel(ax, ay)
-        x1, y1 = frame.pixel(bx, by)
-        steps = max(1, int(math.hypot(x1 - x0, y1 - y0) * 2))
-        for i in range(steps + 1):
-            x = x0 + (x1 - x0) * i / steps
-            y = y0 + (y1 - y0) * i / steps
-            for yy in range(int(y - half), int(y + half) + 1):
-                for xx in range(int(x - half), int(x + half) + 1):
-                    if 0 <= xx < width and 0 <= yy < height:
-                        painted.add((xx, yy))
-        drawn += 1
-    r, g, b, a = C_PATH
-    for xx, yy in painted:
-        px = rows[yy][xx * 4 : xx * 4 + 4]
-        if px[3]:
-            rows[yy][xx * 4 : xx * 4 + 4] = bytes((
-                (px[0] * (255 - a) + r * a) // 255,
-                (px[1] * (255 - a) + g * a) // 255,
-                (px[2] * (255 - a) + b * a) // 255,
-                255,
-            ))
-    return drawn
+    segments = [
+        (frame.pixel(ax, ay), frame.pixel(bx, by))
+        for (ax, ay), (bx, by) in zip(path, path[1:])
+        if math.hypot(bx - ax, by - ay) <= max_jump
+    ]
+    _stroke(rows, frame.image_w, frame.image_h, segments, C_PATH, max(0.5, frame.scale / 4))
+    return len(segments)
 
 
 def render_k10_overlay(
@@ -482,6 +559,7 @@ def render_k10_overlay(
     result: dict[str, Any] = {"pixel": None, "path_segments": 0}
     if path:
         result["path_segments"] = _draw_path(rows, frame, path)
+    rows = _draw_labels(rows, width, height, map_data.get("_labels") or [], frame.scale)
     if pose is not None:
         x, y = frame.pixel(pose[0], pose[1])
         if not (0 <= x < width and 0 <= y < height):

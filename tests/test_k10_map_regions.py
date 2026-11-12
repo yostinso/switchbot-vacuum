@@ -5,6 +5,7 @@ Synthetic maps only: no account, network or robot is used.
 
 import base64
 import json
+import math
 import struct
 import sys
 from datetime import timedelta
@@ -51,12 +52,19 @@ def b64(text: str) -> str:
 W, H, RES, X0, Y0 = 40, 30, 0.05, -1.0, -0.5
 
 
-def grid_bytes() -> bytes:
-    cells = bytearray(W * H)
+# (unexplored, floor, wall) cell values. "k10" was observed on a K10+;
+# "other360" is the encoding BotslabHASS decodes for other 360 robots.
+ENCODINGS = {"k10": (127, 255, 0), "other360": (0, 127, 255)}
+
+
+def grid_bytes(encoding="k10") -> bytes:
+    unexplored, floor, wall = ENCODINGS[encoding]
+    cells = bytearray([unexplored]) * (W * H)
     for r in range(5, 25):
         for c in range(5, 35):
             edge = r in (5, 24) or c in (5, 34)
-            cells[r * W + c] = 255 if edge else 127
+            cells[r * W + c] = wall if edge else floor
+    cells[12 * W + 25] = wall  # an obstacle speck inside a room
     return bytes(cells)
 
 
@@ -65,7 +73,7 @@ def mm(col: float, row: float) -> list[float]:
     return [round((X0 + col * RES) * 1000, 3), round((Y0 + row * RES) * 1000, 3)]
 
 
-def k10_map_record(*, vertex_scale=1.0) -> dict:
+def k10_map_record(*, vertex_scale=1.0, encoding="k10") -> dict:
     left = [mm(6, 6), mm(20, 6), mm(20, 24), mm(6, 24)]
     right = [mm(20, 6), mm(34, 6), mm(34, 24), mm(20, 24)]
     def scale(poly):
@@ -79,7 +87,7 @@ def k10_map_record(*, vertex_scale=1.0) -> dict:
         "resolution": RES,
         "x_min": X0,
         "y_min": Y0,
-        "map": base64.b64encode(lz4_literals(grid_bytes())).decode(),
+        "map": base64.b64encode(lz4_literals(grid_bytes(encoding))).decode(),
         "chargeHandlePos": [v * vertex_scale for v in mm(30, 8)],
         "smartArea": {
             "mapId": 101,
@@ -418,12 +426,52 @@ class RenderTests(unittest.TestCase):
         self.assertEqual(len(raw), height * (1 + width * 4))
 
     def test_room_fill_stats(self):
-        stats = k10_map.decode_k10_map(k10_map_record())["_room_stats"]["rooms"]
-        self.assertEqual(len(stats), 2)
-        for room in stats:
-            self.assertGreater(room["cells_coloured"], 0)
-            self.assertLessEqual(room["cells_coloured"], room["cells_inside"])
-            self.assertIn("127", room["grid_values_inside"])
+        stats = k10_map.decode_k10_map(k10_map_record())["_room_stats"]
+        self.assertEqual(stats["grid_classes"], {"background": 127, "floor": 255})
+        self.assertEqual(len(stats["rooms"]), 2)
+        for room in stats["rooms"]:
+            self.assertGreater(room["cells_coloured"], 0.8 * room["cells_inside"])
+            self.assertIn("255", room["grid_values_inside"])
+
+    def test_both_grid_encodings_render_the_same(self):
+        k10 = k10_map.decode_k10_map(k10_map_record(encoding="k10"))
+        other = k10_map.decode_k10_map(k10_map_record(encoding="other360"))
+        self.assertEqual(other["_room_stats"]["grid_classes"], {"background": 0, "floor": 127})
+        self.assertEqual(k10["_render_rows"], other["_render_rows"])
+        attrs = k10["attributes"]
+        # Walls/obstacles are dark; unexplored space is transparent.
+        frame = k10_map._Frame(*k10["_frame"])
+        speck = frame.pixel(*mm(25.5, 12.5))
+        self.assertEqual(pixel(k10, *speck), k10_map.C_WALL)
+        self.assertEqual(pixel(k10, 0, 0)[3], 0)
+        self.assertEqual(len(attrs["rooms"]), 2)
+
+    def test_labels_are_drawn_near_room_centres(self):
+        rendered = k10_map.decode_k10_map(k10_map_record())
+        names = [label[0] for label in rendered["_labels"]]
+        self.assertEqual(names, ["Kitchen", "Den"])
+        frame = k10_map._Frame(*rendered["_frame"])
+        kitchen_centre = frame.pixel(*mm(13, 15))
+        _, lx, ly = rendered["_labels"][0]
+        self.assertLess(math.hypot(lx - kitchen_centre[0], ly - kitchen_centre[1]),
+                        2 * frame.scale)
+        # Labels are in the published image but not in the cached base pixels.
+        rows = render_rows(rendered["image"])
+        self.assertNotEqual(tuple(rows[int(ly)][int(lx) * 4 : int(lx) * 4 + 4]),
+                            pixel(rendered, lx, ly))
+        overlay = render_rows(k10_map.render_k10_overlay(rendered)["image"])
+        self.assertEqual(overlay, rows)
+
+    def test_nogo_zone_is_visible_over_unexplored_space(self):
+        record = k10_map_record()
+        record["area"] = [{"vertexs": [mm(1, 1), mm(4, 1), mm(4, 4), mm(1, 4)]}]
+        rendered = k10_map.decode_k10_map(record)
+        frame = k10_map._Frame(*rendered["_frame"])
+        x, y = frame.pixel(*mm(2.5, 2.5))
+        self.assertEqual(pixel(rendered, x, y), (*k10_map.C_NOGO, 90))
+        # The crop grows to keep the whole zone (it starts 4 cells outside the house).
+        plain = k10_map.decode_k10_map(k10_map_record())
+        self.assertGreater(rendered["attributes"]["width"], plain["attributes"]["width"])
 
     def test_rotation_flips_both_axes(self):
         rendered = k10_map.decode_k10_map(k10_map_record())
@@ -504,7 +552,7 @@ class RenderTests(unittest.TestCase):
         rows = render_rows(result["image"])
         after = tuple(rows[int(mid_y)][int(mid_x) * 4 : int(mid_x) * 4 + 4])
         self.assertNotEqual(before, after)
-        gap_x, gap_y = frame.pixel(*mm(24, 15))
+        gap_x, gap_y = frame.pixel(*mm(33, 21.7))  # on the skipped hop, clear of labels
         self.assertEqual(pixel(rendered, gap_x, gap_y),
                          tuple(rows[int(gap_y)][int(gap_x) * 4 : int(gap_x) * 4 + 4]))
 

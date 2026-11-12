@@ -325,7 +325,7 @@ The K10+ is a Qihoo 360 platform robot. Its rooms and map live on 360's regional
 
 ### K10+ map (experimental)
 
-The **Map** image entity is now created for K10+ as well. It decodes the map package the robot uploads after mapping or cleaning: an LZ4-compressed occupancy grid (unknown / floor / wall), the room polygons used for room cleaning, no-go areas and the dock. Unknown space is transparent, so the image works on light and dark dashboards.
+The **Map** image entity is now created for K10+ as well. It decodes the map package the robot uploads after mapping or cleaning: an LZ4-compressed occupancy grid, the room polygons used for room cleaning, no-go areas and the dock. Rooms are filled in their own colours and labelled with their names near the middle, no-go zones are drawn in red, and walls and obstacles are dark. Unexplored space is transparent, so the image works on light and dark dashboards.
 
 - If the current map object has expired (the robot stores it for one day), the permanent recorded map for the same map ID is used instead.
 - The robot's reported `CurrentLocation` is drawn as an orange marker with a heading line whenever it changes. Heading units have not been confirmed on hardware.
@@ -334,7 +334,7 @@ The **Map** image entity is now created for K10+ as well. It decodes the map pac
 - Attributes: `rooms` (pixel `outline`, `outline_vacuum` in robot millimetres, label `x`/`y`), `charger`, `charger_position`, `vacuum_position`, `calibration_points`, and `coordinate_fit`.
 - `calibration_points` and `vacuum_position` follow the conventions of [xiaomi-vacuum-map-card](https://github.com/PiotrMachowski/lovelace-xiaomi-vacuum-map-card), so the image can be used as that card's map with `calibration_source: {entity: image.<your_map>}`. Use `outline_vacuum` for room outlines in its `predefined_selections`, and call `switchbot_vacuum.clean_rooms` from its service templates.
 
-The grid format was confirmed against other 360-platform robots, not yet against a K10+. Units are checked rather than assumed: the decoder picks the interpretation that puts the room polygons on the grid, and reports it in `coordinate_fit`. If the map looks wrong, use **Download diagnostics** on the integration. The file contains only structure (key names, types, grid size, value counts and coordinate ranges), with no credentials, signed URLs, device identifiers or room names. Attach it to an issue.
+The grid encoding is detected rather than assumed: on a K10+ unexplored space is 127, floor 255 and walls 0, while other 360 robots use 0, 127 and 255. Units are also checked rather than assumed: the decoder picks the interpretation that puts the room polygons on the grid, and reports it in `coordinate_fit`. If the map looks wrong, use **Download diagnostics** on the integration. The file contains only structure (key names, types, grid size, value counts and coordinate ranges), with no credentials, signed URLs, device identifiers or room names. Attach it to an issue.
 
 ## Technical notes
 
