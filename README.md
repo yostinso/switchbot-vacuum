@@ -50,7 +50,9 @@ K10+ support was tested with a **SwitchBot Mini Robot Vacuum K10+ (EU)** in **Ho
 
 Verified through Home Assistant: email/password login and reauthentication after a password change, room discovery, device status and battery, starting a selected room with one pass, pausing, changing suction from max to quiet, quiet room cleaning, and emptying the dustbin.
 
-Mop mode, two passes, multi-room cleaning order, multiple physical vacuums, and long-running automatic refresh have not yet been verified on hardware. Other K10+ regions and K10+ Pro have not been tested.
+A **SwitchBot Mini Robot Vacuum K10+ on a US account** (`na1`) was tested with **Home Assistant OS 2026.11.1**. Verified: region detection, room discovery, the map image (rooms, labels, no-go zones, dock, orientation), the robot position and cleaning path updating during a clean, and starting a selected room.
+
+Mop mode, two passes, multi-room cleaning order, multiple physical vacuums, and long-running automatic refresh have not yet been verified on hardware. For the US setup, `vacuum.clean_area`, the post-cleaning map refresh and the diagnostic sensors have not yet been verified on hardware. The Asia-Pacific region (`ap1`) and K10+ Pro have not been tested.
 
 ## Installation
 
