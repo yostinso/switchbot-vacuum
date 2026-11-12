@@ -10,16 +10,16 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import DEVICE_TYPE_K10, DOMAIN
 from .coordinator import SwitchBotS10Coordinator
-from .k10_api import WONDER
+from .k10_api import botslab_region
 
 
 async def async_setup_entry(
     hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback
 ) -> None:
     coordinator = hass.data[DOMAIN][entry.entry_id]
-    if entry.data.get("device_type") == DEVICE_TYPE_K10 and (
-        coordinator.wonderlab_endpoint or ""
-    ).rstrip("/") == WONDER:
+    if entry.data.get("device_type") == DEVICE_TYPE_K10 and botslab_region(
+        coordinator.wonderlab_endpoint
+    ):
         async_add_entities([SwitchBotEmptyDustbin(coordinator)])
 
 

@@ -54,7 +54,8 @@ from .const import (
     TOKEN_REFRESH_SECONDS,
     UPDATE_INTERVAL_SECONDS,
 )
-from .k10_api import CLEAN_MODES, WONDER, K10Api, K10ProtocolError, room_names
+from .k10_api import CLEAN_MODES, K10Api, K10ProtocolError, botslab_region, room_names
+from .k10_map import decode_k10_map, describe_map, parse_pose, render_k10_position
 from .route_data import download_route, render_position
 
 _LOGGER = logging.getLogger(__name__)
@@ -126,6 +127,21 @@ def _download_map_rooms(
     return decode_map(zip_bytes)
 
 
+def _render_k10_map(
+    map_data: dict[str, Any], record_count: int, source: str | None
+) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    """Decode a K10+ map in an executor; always return a redacted summary."""
+    summary = describe_map(map_data, record_count) | {"source": source}
+    try:
+        rendered = decode_k10_map(map_data)
+    except (ValueError, KeyError, TypeError, IndexError) as exc:
+        summary["render_error"] = type(exc).__name__
+        _LOGGER.warning("K10+ map could not be rendered (%s)", type(exc).__name__)
+        return None, summary
+    summary["coordinate_fit"] = rendered["attributes"]["coordinate_fit"]
+    return rendered, summary
+
+
 STATUS_PROPS = [PROP_ONLINE, PROP_BATTERY, PROP_WORK_STATUS, PROP_ERROR_CODE,
                 PROP_CLEAN_MODE, PROP_CLEAN_SUMMARY, PROP_FIRMWARE]
 K10PRO_STATUS_PROPS = [
@@ -147,6 +163,14 @@ def _status_code_for_log(value: Any) -> int | str:
 
 class SwitchBotS10Coordinator(DataUpdateCoordinator):
     """Manage fetching data from SwitchBot Vacuum API."""
+
+    # K10+ map state; class defaults so partially constructed instances stay valid.
+    # Each is reassigned (never mutated in place).
+    _k10_pose: tuple[float, float, float] | None = None
+    _k10_map_marker: Any = None
+    k10_map_summary: dict[str, Any] | None = None
+    k10_property_shapes: dict[str, str] = {}
+    k10_last_error: str | None = None
 
     def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
         """Initialize."""
@@ -459,16 +483,35 @@ class SwitchBotS10Coordinator(DataUpdateCoordinator):
             try:
                 session = async_get_clientsession(self.hass)
                 api = await self._authorize_k10_api(session)
-                map_data, _ = await api.get_map(session)
-                self._rooms = {
-                    f"room{room_id}": name for room_id, name in room_names(map_data).items()
-                }
+                map_data, _ = await api.get_map(session, strict=False)
+                if "smartArea" in map_data:
+                    self._rooms = {
+                        f"room{room_id}": name for room_id, name in room_names(map_data).items()
+                    }
+                    self._persist_rooms()
                 self._last_room_refresh = time.time()
-            except (
-                aiohttp.ClientError, TimeoutError, ValueError, KeyError, TypeError, K10ProtocolError
-            ) as exc:
+                self.k10_last_error = None
+            except K10ProtocolError as exc:
+                # Protocol errors carry only fixed messages and numeric codes.
+                self.k10_last_error = str(exc)
+                _LOGGER.warning("K10+ map refresh failed: %s", exc)
+                return
+            except (aiohttp.ClientError, TimeoutError, ValueError, KeyError, TypeError) as exc:
                 # Network exceptions may contain a signed map URL; log only the type.
+                self.k10_last_error = type(exc).__name__
                 _LOGGER.warning("K10+ map refresh failed (%s)", type(exc).__name__)
+                return
+            rendered, self.k10_map_summary = await self.hass.async_add_executor_job(
+                _render_k10_map, map_data, api.map_record_count, api.map_source
+            )
+            if rendered is not None:
+                self.map_data = rendered
+                self.map_updated = datetime.now().astimezone()
+                self._k10_pose = None
+                _LOGGER.info(
+                    "Rendered K10+ map (%s rooms, fit %s)", len(rendered["rooms"]),
+                    rendered["attributes"]["coordinate_fit"],
+                )
             return
         try:
             resp = await self.async_send_action("GetCleanPolicyList")
@@ -826,6 +869,36 @@ class SwitchBotS10Coordinator(DataUpdateCoordinator):
         if not self.access_token or time.time() >= self._token_expiry:
             await self.async_login()
 
+    async def _async_update_k10_position(self, raw: Any) -> None:
+        """Overlay the robot's reported location when it changes."""
+        pose = parse_pose(raw)
+        snapshot = getattr(self, "map_data", None)
+        if snapshot is None or "_frame" not in snapshot or pose is None or pose == self._k10_pose:
+            return
+        try:
+            rendered = await self.hass.async_add_executor_job(
+                render_k10_position, snapshot, pose
+            )
+        except (ValueError, KeyError, TypeError, IndexError) as exc:
+            _LOGGER.debug("K10+ position not drawn (%s)", type(exc).__name__)
+            return
+        if self.map_data is not snapshot:
+            return  # A map refresh replaced these pixels meanwhile.
+        self._k10_pose = pose
+        now = datetime.now().astimezone()
+        self.map_data = snapshot | {
+            "image": rendered["image"],
+            "attributes": snapshot["attributes"] | {
+                "robot_position_available": True,
+                "robot_position": {
+                    "kind": "reported", "received_at": now.isoformat(),
+                    "x": pose[0], "y": pose[1], "heading": pose[2], "pixel": rendered["pixel"],
+                },
+                "vacuum_position": {"x": pose[0], "y": pose[1], "a": pose[2]},
+            },
+        }
+        self.map_updated = now
+
     async def _async_update_data_k10(self) -> dict[str, Any]:
         """Fetch real-time status data from K10+ via getstatus."""
         status = await self.async_get_k10_status()
@@ -834,7 +907,7 @@ class SwitchBotS10Coordinator(DataUpdateCoordinator):
             self.hass.async_create_task(self._background_room_refresh())
 
         properties = {}
-        if self.wonderlab_endpoint and self.wonderlab_endpoint.rstrip("/") == WONDER:
+        if botslab_region(self.wonderlab_endpoint):
             try:
                 session = async_get_clientsession(self.hass)
                 api = await self._authorize_k10_api(session)
@@ -843,6 +916,16 @@ class SwitchBotS10Coordinator(DataUpdateCoordinator):
                 aiohttp.ClientError, TimeoutError, ValueError, KeyError, TypeError, K10ProtocolError
             ) as exc:
                 _LOGGER.debug("K10+ control properties unavailable (%s)", type(exc).__name__)
+        if properties:
+            self.k10_property_shapes = {
+                str(k): type(v).__name__ for k, v in sorted(properties.items())
+            }
+            # The robot uploads a new map package after cleaning/mapping.
+            marker = properties.get("MapPkgOssInfo")
+            if marker and self._k10_map_marker not in (None, marker):
+                self._last_room_refresh = 0
+            self._k10_map_marker = marker or self._k10_map_marker
+            await self._async_update_k10_position(properties.get("CurrentLocation"))
         mode = next((name for name, value in CLEAN_MODES.items()
                      if value == properties.get("MopModeSwitching")), None)
 

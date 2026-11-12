@@ -15,7 +15,7 @@ The official [SwitchBot Cloud integration](https://www.home-assistant.io/integra
 - **Vacuum entity** with full state reporting (cleaning, docked, paused, returning, idle)
 - **Error detection (S10)** — an error sensor with specific error types and a problem binary sensor for automations. K10+ error reporting is not implemented; see the model support table below.
 - **Room sensor entities** — one per room discovered from the vacuum's map
-- **Room-aware cleaning** — clean specific rooms by name or ID. S10 supports mode, suction, water level, passes, and order; K10+ EU supports vacuum/mop mode, suction, passes, and order. K10+ uses a disposable wipe with no water tank or pump.
+- **Room-aware cleaning** — clean specific rooms by name or ID. S10 supports mode, suction, water level, passes, and order; K10+ supports vacuum/mop mode, suction, passes, and order. K10+ uses a disposable wipe with no water tank or pump.
 - **Automatic room discovery** — room names are downloaded from the vacuum's cloud map every 24 hours
 - **Multi-device support** — if your account has multiple SwitchBot vacuums, the config flow lets you pick which one to add
 - **Force refresh service** — manually re-download room data and device status on demand
@@ -36,11 +36,13 @@ Available features depend on the vacuum model and region.
 | Empty dustbin button | — | Supported while docked |
 | Cleaning mode select | — | Vacuum/mop; selecting a mode does not start cleaning |
 | Room command passes and order | Supported | One or two passes; optional room order |
-| Automatic map refresh every 24 hours | Supported | Supported |
+| Automatic map refresh every 24 hours | Supported | Supported, plus after the robot uploads a new map |
+| Map image with rooms and dock | Supported | Supported (experimental, see below) |
+| Robot position on the map | Last received pose during tasks | Reported `CurrentLocation`, redrawn when it changes |
 | Multiple vacuums on one account | Supported | Supported |
 | `force_refresh` for status and rooms | Supported | Supported |
 
-K10+ room cleaning is currently limited to the EU region. K10+ Pro room cleaning is not supported.
+K10+ room cleaning and maps follow the account's SwitchBot region: EU (`eu1`), US (`na1`) and Asia-Pacific (`ap1`). Only EU has been verified on hardware so far. K10+ Pro room cleaning is not supported.
 
 ### Tested setup
 
@@ -175,7 +177,7 @@ Each room discovered from the vacuum's map gets a sensor entity (e.g. `sensor.ki
 
 ### `switchbot_vacuum.clean_rooms`
 
-Clean specific rooms by name or ID. The example and mode/suction/water defaults below apply to S10. For K10+ EU, the same service also accepts `mode` (`sweep` or `mop`) and `fan_level` (1–4), as shown in the K10+ section. Water settings and simultaneous sweep/mop do not apply to this hardware.
+Clean specific rooms by name or ID. The example and mode/suction/water defaults below apply to S10. For K10+, the same service also accepts `mode` (`sweep` or `mop`) and `fan_level` (1–4), as shown in the K10+ section. Water settings and simultaneous sweep/mop do not apply to this hardware.
 
 ```yaml
 service: switchbot_vacuum.clean_rooms
@@ -282,7 +284,7 @@ automation:
           entity_id: vacuum.switchbot_vacuum
 ```
 
-## K10+ rooms (EU region)
+## K10+ rooms
 
 Room names and numeric IDs are read from the vacuum's current cloud map. Creating cleaning schedules is not required. Use `switchbot_vacuum.force_refresh` to refresh the map and room sensors.
 
@@ -316,6 +318,21 @@ The device also exposes a **Cleaning mode** select (`vacuum`, `mop`) and an **Em
 Start requests are never retried automatically. If confirmation times out, check the robot before retrying.
 
 K10+ controls require an internet connection and use an unofficial cloud API, which may change.
+
+### K10+ regions
+
+The K10+ is a Qihoo 360 platform robot. Its rooms and map live on 360's regional cloud (`{region}-sapp-api.botslab.com`), which is chosen from the SwitchBot account's regional host: `wonderlabs.eu…` → `eu1`, `wonderlabs.us…` → `na1`, `wonderlabs.ap…` → `ap1`. Signed map downloads are only followed to that region's 360 storage buckets, and room uploads only go to that region's Aliyun OSS bucket. If a region uses a different upload provider, room cleaning fails with an error naming the provider, and no cleaning is started.
+
+### K10+ map (experimental)
+
+The **Map** image entity is now created for K10+ as well. It decodes the map package the robot uploads after mapping or cleaning: an LZ4-compressed occupancy grid (unknown / floor / wall), the room polygons used for room cleaning, no-go areas and the dock. Unknown space is transparent, so the image works on light and dark dashboards.
+
+- If the current map object has expired (the robot stores it for one day), the permanent recorded map for the same map ID is used instead.
+- The robot's reported `CurrentLocation` is drawn as an orange marker with a heading line whenever it changes. Heading units have not been confirmed on hardware.
+- Attributes: `rooms` (pixel `outline`, `outline_vacuum` in robot millimetres, label `x`/`y`), `charger`, `charger_position`, `vacuum_position`, `calibration_points`, and `coordinate_fit`.
+- `calibration_points` and `vacuum_position` follow the conventions of [xiaomi-vacuum-map-card](https://github.com/PiotrMachowski/lovelace-xiaomi-vacuum-map-card), so the image can be used as that card's map with `calibration_source: {entity: image.<your_map>}`. Use `outline_vacuum` for room outlines in its `predefined_selections`, and call `switchbot_vacuum.clean_rooms` from its service templates.
+
+The grid format was confirmed against other 360-platform robots, not yet against a K10+. Units are checked rather than assumed: the decoder picks the interpretation that puts the room polygons on the grid, and reports it in `coordinate_fit`. If the map looks wrong, use **Download diagnostics** on the integration. The file contains only structure (key names, types, grid size, value counts and coordinate ranges), with no credentials, signed URLs, device identifiers or room names. Attach it to an issue.
 
 ## Technical notes
 

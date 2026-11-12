@@ -1,7 +1,10 @@
-"""K10+ EU room protocol reconstructed from SwitchBot Android 10.6.
+"""K10+ room protocol reconstructed from SwitchBot Android 10.6.
 
 The account token stays on SwitchBot; the delegated token stays on Botslab.
 Only the temporary OSS credentials returned for this upload go to storage.
+
+The K10+ is a Qihoo 360 platform robot. SwitchBot's regional "wonderlabs" host
+determines which regional 360 ("botslab") cloud holds the device.
 """
 
 from __future__ import annotations
@@ -13,6 +16,7 @@ import email.utils
 import hashlib
 import hmac
 import json
+import re
 import time
 import uuid
 from typing import TYPE_CHECKING, Any
@@ -21,6 +25,7 @@ from urllib.parse import quote, urlparse
 if TYPE_CHECKING:
     from aiohttp import ClientSession
 
+# Kept for backwards compatibility with callers/tests that use the EU constants.
 API = "https://eu1-sapp-api.botslab.com"
 WONDER = "https://wonderlabs.eu.api.switchbot.net"
 APP_KEY = "toB_woan_adr"
@@ -30,15 +35,73 @@ APP_SECRET = "cec7fba0b848ae747f0af304ce4d1e54"
 ROOM_SUCTION = {1: "quiet", 2: "auto", 3: "strong", 4: "max"}
 CLEAN_MODES = {"sweep": 0, "mop": 2}
 
-MAP_HOSTS = {
-    "eu1-ali-1days.oss-eu-central-1.aliyuncs.com",
-    "eu1-ali-90days.oss-eu-central-1.aliyuncs.com",
-    "eu1-ali-180days.oss-eu-central-1.aliyuncs.com",
-}
+# SwitchBot wonderlabs region label -> Qihoo 360 cloud region. The 360 regions
+# (eu1, na1, ap1, eu2) are confirmed by independent Botslab client projects.
+BOTSLAB_REGIONS = {"eu": "eu1", "us": "na1", "na": "na1", "ap": "ap1"}
+_WONDER_RE = re.compile(r"^https://wonderlabs\.([a-z0-9]+)\.api\.switchbot\.net/?$")
+_OSS_ENDPOINT_RE = re.compile(r"^oss-[a-z0-9-]+\.aliyuncs\.com$")
+_STORAGE_SUFFIXES = (".aliyuncs.com", ".amazonaws.com")
 
 
 class K10ProtocolError(Exception):
     """A validated K10+ operation could not be completed."""
+
+
+def botslab_region(wonder_endpoint: str | None) -> str | None:
+    """Return the 360 cloud region for a SwitchBot regional endpoint, if known."""
+    match = _WONDER_RE.match(wonder_endpoint or "")
+    return BOTSLAB_REGIONS.get(match.group(1)) if match else None
+
+
+def api_host(region: str) -> str:
+    return f"https://{region}-sapp-api.botslab.com"
+
+
+def trusted_storage_url(url: str, region: str) -> bool:
+    """Signed map URLs must point at this region's 360 storage buckets."""
+    parsed = urlparse(url)
+    host = parsed.hostname or ""
+    return (
+        parsed.scheme == "https"
+        and host.endswith(_STORAGE_SUFFIXES)
+        and host.split(".", 1)[0].startswith(f"{region}-")
+    )
+
+
+def parse_package(raw: bytes | str) -> list[dict[str, Any]]:
+    """Decode a map package: one JSON object or several concatenated records.
+
+    360 robots upload either a single map object or a stream of JSON records
+    (some wrapped as ``{"infoType": ..., "data": {...}}``). Return the dicts.
+    """
+    text = raw.decode("utf-8") if isinstance(raw, bytes) else raw
+    decoder = json.JSONDecoder()
+    records: list[dict[str, Any]] = []
+    index, length = 0, len(text)
+    while index < length:
+        while index < length and text[index] in " \r\n\t\x00":
+            index += 1
+        if index >= length:
+            break
+        obj, index = decoder.raw_decode(text, index)
+        if isinstance(obj, dict):
+            data = obj.get("data")
+            records.append(data if isinstance(data, dict) and "infoType" in obj else obj)
+    if not records:
+        raise ValueError("Empty map package")
+    return records
+
+
+def select_map_record(records: list[dict[str, Any]]) -> dict[str, Any]:
+    """Merge the room record and the occupancy-grid record into one map dict."""
+    merged: dict[str, Any] = {}
+    for record in records:
+        if "smartArea" in record or ("map" in record and "width" in record):
+            for key, value in record.items():
+                merged.setdefault(key, value)
+    if "smartArea" not in merged and not ("map" in merged and "width" in merged):
+        raise ValueError("Map package has neither rooms nor an occupancy grid")
+    return merged
 
 
 def signed_params(
@@ -114,13 +177,16 @@ def prepare_rooms(
 
 
 def oss_request(
-    info: dict[str, Any], content: bytes, *, date: str | None = None
+    info: dict[str, Any], content: bytes, *, date: str | None = None, region: str = "eu1"
 ) -> tuple[str, dict[str, str], str]:
     """Build the documented OSS V1 PUT; never forward account tokens to OSS."""
-    if (info["provider"], info["bucket"], info["endpoint"]) != (
-        "aliyun",
-        "eu1-ali-1days",
-        "oss-eu-central-1.aliyuncs.com",
+    if info.get("provider") != "aliyun":
+        # Report the provider name only; it is needed to add support and is not secret.
+        raise K10ProtocolError(
+            f"Room upload storage provider {str(info.get('provider'))[:20]!r} is not supported"
+        )
+    if not re.fullmatch(rf"{re.escape(region)}-ali-\d+days", str(info.get("bucket", ""))) or (
+        not _OSS_ENDPOINT_RE.fullmatch(str(info.get("endpoint", "")))
     ):
         raise K10ProtocolError("Unsupported room upload storage destination")
     key = info["path"]
@@ -160,19 +226,29 @@ class K10Api:
         self.installation_id = installation_id
         self.token: str | None = None
         self.token_expiry: float = 0
+        self.region = "eu1"
+        self.map_source: str | None = None
+        self.map_record_count = 0
         self.lock = asyncio.Lock()
+
+    @property
+    def api(self) -> str:
+        return api_host(self.region)
 
     async def authorize(
         self, session: ClientSession, wonder_endpoint: str, access_token: str, group_id: str
     ) -> None:
-        if wonder_endpoint.rstrip("/") != WONDER:
-            raise K10ProtocolError("K10 room support has only been verified for the EU region")
+        region = botslab_region(wonder_endpoint)
+        if region is None:
+            raise K10ProtocolError("K10+ room support is not available for this SwitchBot region")
+        if region != self.region:
+            self.region, self.token, self.token_expiry = region, None, 0
         if self.token and self.token_expiry > time.time() + 60:
             return
         async with (
             asyncio.timeout(30),
             session.post(
-                WONDER + "/wonder/sweeper360/v1/auth/applyToken",
+                wonder_endpoint.rstrip("/") + "/wonder/sweeper360/v1/auth/applyToken",
                 headers={"authorization": access_token},
                 json={"groupID": group_id},
                 allow_redirects=False,
@@ -199,7 +275,7 @@ class K10Api:
             asyncio.timeout(30),
             session.request(
                 method,
-                API + path,
+                self.api + path,
                 params=params,
                 data=form,
                 headers={"Authorization": "tokens " + self.token},
@@ -279,27 +355,75 @@ class K10Api:
                 raise K10ProtocolError("Dock the K10+ before emptying its dustbin")
             await self.invoke_service(session, "StartCollectingDust", {})
 
-    async def get_map(self, session: ClientSession) -> tuple[dict[str, Any], dict[str, Any]]:
+    async def _download_package(self, session: ClientSession, url: str) -> dict[str, Any] | None:
+        """Fetch a signed map object; None if it has expired or holds no map."""
+        if not trusted_storage_url(url, self.region):
+            raise K10ProtocolError("Unexpected signed map destination")
+        async with asyncio.timeout(30), session.get(url, allow_redirects=False) as response:
+            if response.status in (403, 404):
+                return None  # 1-day objects expire; try the recorded map instead.
+            if response.status != 200:
+                raise K10ProtocolError(f"Map storage returned HTTP {response.status}")
+            raw = await response.read()
+        if len(raw) > 32 * 1024 * 1024:
+            raise K10ProtocolError("Map package is too large")
+        try:
+            records = parse_package(raw)
+            map_data = select_map_record(records)
+        except ValueError:
+            return None
+        self.map_record_count = len(records)
+        return map_data
+
+    async def get_map(
+        self, session: ClientSession, *, strict: bool = True
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Return the current map and the device's MapPkgOssInfo.
+
+        ``strict`` (used before cleaning) requires the map to belong to the
+        device's current MapID; display refreshes also accept the recorded map.
+        """
         result = await self.request(session, "/v1/iot/device/get_property", extend=1)
         if result.get("code") != 0:
             raise K10ProtocolError(f"Cannot read map properties (code {result.get('code')})")
         data = result["data"]
-        properties = json.loads(data["result"])
-        map_info = json.loads(properties["MapPkgOssInfo"])
-        url = data["extend"]["s3_signs"][map_info["Url"]]
-        parsed = urlparse(url)
-        if parsed.scheme != "https" or parsed.hostname not in MAP_HOSTS:
-            raise K10ProtocolError("Unexpected signed map destination")
-        async with asyncio.timeout(30), session.get(url, allow_redirects=False) as response:
-            if response.status != 200:
-                raise K10ProtocolError(f"Map storage returned HTTP {response.status}")
-            map_data = json.loads(await response.read())
-        if (
-            str(map_data["mapId"]) != str(map_info["MapID"])
-            or map_data["cleanId"] != map_info["CleanID"]
-        ):
-            raise K10ProtocolError("Map file and device metadata do not match")
-        return map_data, map_info
+        properties = data["result"]
+        properties = json.loads(properties) if isinstance(properties, str) else properties
+        signs = (data.get("extend") or {}).get("s3_signs") or {}
+
+        def as_dict(value: Any) -> dict[str, Any]:
+            value = json.loads(value) if isinstance(value, str) and value else value
+            return value if isinstance(value, dict) else {}
+
+        map_info = as_dict(properties.get("MapPkgOssInfo"))
+        map_id = str(map_info["MapID"]) if map_info.get("MapID") is not None else None
+        candidates: list[tuple[str, str]] = []
+        if map_info.get("Url") in signs:
+            candidates.append(("current", signs[map_info["Url"]]))
+        for recorded in as_dict(properties.get("RecordedMapList")).get("RecordedMaps") or []:
+            if not isinstance(recorded, dict):
+                continue
+            if map_id and str(recorded.get("MapID", map_id)) != map_id:
+                continue
+            for key in ("PermSaveUrl", "PermBinSaveUrl"):
+                if recorded.get(key) in signs:
+                    candidates.append(("recorded", signs[recorded[key]]))
+        if not candidates:
+            raise K10ProtocolError("The vacuum has not uploaded a map yet")
+
+        for source, url in candidates:
+            map_data = await self._download_package(session, url)
+            if map_data is None:
+                continue
+            if strict and map_id and str(map_data.get("mapId", map_id)) != map_id:
+                continue
+            if strict and source == "current" and map_data.get("cleanId") != map_info.get("CleanID"):
+                raise K10ProtocolError("Map file and device metadata do not match")
+            if strict and "smartArea" not in map_data:
+                continue
+            self.map_source = source
+            return map_data, map_info
+        raise K10ProtocolError("No usable map package was found")
 
     async def clean_rooms(
         self, session: ClientSession, requested: list[str], times: int = 1, force_order: bool = True,
@@ -326,7 +450,9 @@ class K10Api:
             if config.get("code") != 0:
                 raise K10ProtocolError("Could not obtain room upload configuration")
             content = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode()
-            url, headers, robot_url = oss_request(config["data"]["upload_info"], content)
+            url, headers, robot_url = oss_request(
+                config["data"]["upload_info"], content, region=self.region
+            )
             async with (
                 asyncio.timeout(30),
                 session.put(url, headers=headers, data=content, allow_redirects=False) as response,
