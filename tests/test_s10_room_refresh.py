@@ -270,6 +270,7 @@ async def test_room_listener_is_removed_on_entry_unload():
     coord.data = {"rooms": ROOMS}
     coord.device_mac = "AABBCCDDEEFF"
     entry = SimpleNamespace(entry_id="test-entry", data={"device_type": DEVICE_TYPE_S10},
+                            options={"room_sensors_hidden": True},
                             async_on_unload=MagicMock())
     hass = MagicMock()
     hass.data = {DOMAIN: {entry.entry_id: coord}}

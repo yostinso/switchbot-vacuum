@@ -11,13 +11,21 @@ from homeassistant.components.sensor import (
     SensorStateClass,
 )
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import PERCENTAGE, UnitOfTime
+from homeassistant.const import PERCENTAGE, EntityCategory, UnitOfTime
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .const import DEVICE_TYPE_K10, DEVICE_TYPE_K10PRO, DOMAIN, ERROR_CODES, WORK_STATUS_FAULT
+from .const import (
+    CONF_DEVICE_MAC,
+    DEVICE_TYPE_K10,
+    DEVICE_TYPE_K10PRO,
+    DOMAIN,
+    ERROR_CODES,
+    WORK_STATUS_FAULT,
+)
 from .coordinator import SwitchBotS10Coordinator
 
 _LOGGER = logging.getLogger(__name__)
@@ -91,6 +99,7 @@ async def async_setup_entry(
         )
 
     async_add_entities(entities)
+    _async_hide_existing_room_sensors(hass, entry)
 
     known_room_ids: set[str] = set()
 
@@ -110,6 +119,35 @@ async def async_setup_entry(
 
     _async_add_new_rooms()
     entry.async_on_unload(coordinator.async_add_listener(_async_add_new_rooms))
+
+
+ROOM_SENSORS_HIDDEN = "room_sensors_hidden"
+
+
+@callback
+def _async_hide_existing_room_sensors(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Disable room sensors registered before they were hidden by default.
+
+    Runs once per entry; sensors the user re-enables afterwards stay enabled.
+    """
+    if entry.options.get(ROOM_SENSORS_HIDDEN):
+        return
+    registry = er.async_get(hass)
+    prefix = f"{entry.data.get(CONF_DEVICE_MAC)}_room_"
+    for entity in er.async_entries_for_config_entry(registry, entry.entry_id):
+        if (
+            entity.domain == "sensor"
+            and entity.unique_id.startswith(prefix)
+            and entity.disabled_by is None
+        ):
+            registry.async_update_entity(
+                entity.entity_id,
+                disabled_by=er.RegistryEntryDisabler.INTEGRATION,
+                entity_category=EntityCategory.DIAGNOSTIC,
+            )
+    hass.config_entries.async_update_entry(
+        entry, options={**entry.options, ROOM_SENSORS_HIDDEN: True}
+    )
 
 
 class SwitchBotVacuumBattery(CoordinatorEntity[SwitchBotS10Coordinator], SensorEntity):
@@ -134,7 +172,15 @@ class SwitchBotVacuumBattery(CoordinatorEntity[SwitchBotS10Coordinator], SensorE
 
 
 class SwitchBotRoomSensor(CoordinatorEntity[SwitchBotS10Coordinator], SensorEntity):
-    """Sensor representing a room known to the vacuum."""
+    """Sensor representing a room known to the vacuum.
+
+    Hidden by default: rooms are exposed as vacuum segments for area cleaning,
+    in the vacuum's ``rooms`` attribute and on the map. Enable a sensor to use
+    its ``room_id`` attribute in templates.
+    """
+
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_entity_registry_enabled_default = False
 
     def __init__(
         self,

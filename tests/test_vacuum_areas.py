@@ -108,3 +108,49 @@ class RoomChangeTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RoomSensorVisibilityTests(unittest.TestCase):
+    def test_new_room_sensors_are_hidden_diagnostics(self):
+        from homeassistant.const import EntityCategory
+
+        from custom_components.switchbot_vacuum import sensor
+
+        entity = sensor.SwitchBotRoomSensor(coordinator(), "room1", "Kitchen")
+        self.assertFalse(entity.entity_registry_enabled_default)
+        self.assertEqual(entity.entity_category, EntityCategory.DIAGNOSTIC)
+
+    def run_migration(self, options):
+        from custom_components.switchbot_vacuum import sensor
+
+        def reg(unique_id, disabled_by=None, domain="sensor"):
+            return SimpleNamespace(entity_id=f"{domain}.{unique_id}", unique_id=unique_id,
+                                   domain=domain, disabled_by=disabled_by)
+
+        entries = [
+            reg("FAKEDEVICE_room_room1"),
+            reg("FAKEDEVICE_room_room2", disabled_by="user"),
+            reg("FAKEDEVICE_battery"),
+            reg("FAKEDEVICE_room_x", domain="binary_sensor"),
+        ]
+        registry = MagicMock()
+        hass = MagicMock()
+        entry = SimpleNamespace(entry_id="e", data={"device_mac": "FAKEDEVICE"}, options=options)
+        with (
+            patch.object(sensor.er, "async_get", return_value=registry),
+            patch.object(sensor.er, "async_entries_for_config_entry", return_value=entries),
+        ):
+            sensor._async_hide_existing_room_sensors(hass, entry)
+        return registry, hass
+
+    def test_existing_enabled_room_sensors_are_disabled_once(self):
+        registry, hass = self.run_migration({"cached_rooms": {}})
+        updated = [c.args[0] for c in registry.async_update_entity.call_args_list]
+        self.assertEqual(updated, ["sensor.FAKEDEVICE_room_room1"])
+        options = hass.config_entries.async_update_entry.call_args.kwargs["options"]
+        self.assertEqual(options, {"cached_rooms": {}, "room_sensors_hidden": True})
+
+    def test_migration_does_not_repeat(self):
+        registry, hass = self.run_migration({"room_sensors_hidden": True})
+        registry.async_update_entity.assert_not_called()
+        hass.config_entries.async_update_entry.assert_not_called()

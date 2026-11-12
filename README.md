@@ -166,7 +166,7 @@ Both entities expose `error_code` (raw integer) and `error_type`/`error_descript
 
 ### Room sensors
 
-Each room discovered from the vacuum's map gets a sensor entity (e.g. `sensor.kitchen`, `sensor.bedroom`). The sensor value is the room name, and the `room_id` attribute contains the internal ID (S10: e.g. `ROOM_013`; K10+: e.g. `room1`).
+Each room discovered from the vacuum's map gets a sensor entity (e.g. `sensor.kitchen`, `sensor.bedroom`). These are diagnostic entities, **disabled by default**, because rooms are already available for area cleaning, in the vacuum's `rooms` attribute and on the map. Room sensors created by earlier versions are disabled once on upgrade; enable any you use from the device page and they stay enabled. The sensor value is the room name, and the `room_id` attribute contains the internal ID (S10: e.g. `ROOM_013`; K10+: e.g. `room1`).
 
 ```yaml
 # Get room ID for use in clean_rooms service
