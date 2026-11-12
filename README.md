@@ -175,6 +175,22 @@ Each room discovered from the vacuum's map gets a sensor entity (e.g. `sensor.ki
 
 ## Services
 
+### `vacuum.clean_area` (Home Assistant areas)
+
+On Home Assistant 2026.x the vacuum entity reports its rooms as cleanable segments (S10 and K10+; not K10+ Pro). In the vacuum entity's settings, map each room to one of your Home Assistant areas. Then use the built-in action, voice assistants, or the standard vacuum UI:
+
+```yaml
+action: vacuum.clean_area
+target:
+  entity_id: vacuum.switchbot_vacuum
+data:
+  cleaning_area_id:
+    - kitchen
+    - dining_room
+```
+
+Rooms are cleaned in the order given, with each room's app settings. If rooms are later added or removed in the SwitchBot app, a Repairs issue asks you to update the mapping. Renaming a room keeps its mapping. Use `switchbot_vacuum.clean_rooms` below when you need per-run mode, suction or pass overrides.
+
 ### `switchbot_vacuum.clean_rooms`
 
 Clean specific rooms by name or ID. The example and mode/suction/water defaults below apply to S10. For K10+, the same service also accepts `mode` (`sweep` or `mop`) and `fan_level` (1–4), as shown in the K10+ section. Water settings and simultaneous sweep/mop do not apply to this hardware.

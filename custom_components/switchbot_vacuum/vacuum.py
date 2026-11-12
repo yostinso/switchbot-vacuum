@@ -7,12 +7,13 @@ from typing import Any
 import aiohttp
 import voluptuous as vol
 from homeassistant.components.vacuum import (
+    Segment,
     StateVacuumEntity,
     VacuumActivity,
     VacuumEntityFeature,
 )
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers import entity_platform
 from homeassistant.helpers.entity import DeviceInfo
@@ -90,6 +91,16 @@ S10_STATUS_TO_ACTIVITY = {
 
 FAN_LEVEL_TO_SPEED = {v: k for k, v in FAN_SPEEDS.items()}
 
+BASE_FEATURES = (
+    VacuumEntityFeature.STATE
+    | VacuumEntityFeature.START
+    | VacuumEntityFeature.STOP
+    | VacuumEntityFeature.PAUSE
+    | VacuumEntityFeature.RETURN_HOME
+    | VacuumEntityFeature.FAN_SPEED
+    | VacuumEntityFeature.SEND_COMMAND
+)
+
 
 async def async_setup_entry(
     hass: HomeAssistant,
@@ -133,15 +144,8 @@ async def async_setup_entry(
 class SwitchBotS10Vacuum(CoordinatorEntity[SwitchBotS10Coordinator], StateVacuumEntity):
     """SwitchBot Vacuum vacuum entity."""
 
-    _attr_supported_features = (
-        VacuumEntityFeature.STATE
-        | VacuumEntityFeature.START
-        | VacuumEntityFeature.STOP
-        | VacuumEntityFeature.PAUSE
-        | VacuumEntityFeature.RETURN_HOME
-        | VacuumEntityFeature.FAN_SPEED
-        | VacuumEntityFeature.SEND_COMMAND
-    )
+    _attr_supported_features = BASE_FEATURES
+
     def __init__(self, coordinator: SwitchBotS10Coordinator) -> None:
         """Initialize."""
         super().__init__(coordinator)
@@ -151,6 +155,11 @@ class SwitchBotS10Vacuum(CoordinatorEntity[SwitchBotS10Coordinator], StateVacuum
         self._is_k10 = device_type == DEVICE_TYPE_K10
         self._attr_fan_speed_list = K10_FAN_SPEED_LIST if self._is_k10 else FAN_SPEED_LIST
         self._is_k10_pro = device_type == DEVICE_TYPE_K10PRO
+        if not self._is_k10_pro:
+            # Rooms become HA "segments" that users map to areas for vacuum.clean_area.
+            # K10+ Pro has no room protocol (it would clean the whole house).
+            self._attr_supported_features = BASE_FEATURES | VacuumEntityFeature.CLEAN_AREA
+        self._segments_issue_for: tuple[str, ...] | None = None
         self._attr_device_info = DeviceInfo(
             identifiers={(DOMAIN, coordinator.device_mac)},
             name=coordinator.device_name or "SwitchBot Vacuum",
@@ -354,6 +363,40 @@ class SwitchBotS10Vacuum(CoordinatorEntity[SwitchBotS10Coordinator], StateVacuum
                 },
             })
         await self.coordinator.async_request_refresh()
+
+    async def async_get_segments(self) -> list[Segment]:
+        """Rooms from the vacuum's map, for mapping to Home Assistant areas."""
+        return [
+            Segment(id=room_id, name=name)
+            for room_id, name in sorted(self.coordinator.rooms.items(), key=lambda r: r[1])
+        ]
+
+    async def async_clean_segments(self, segment_ids: list[str], **kwargs: Any) -> None:
+        """Clean the rooms mapped to the requested areas, in the requested order."""
+        await self.async_clean_rooms(list(segment_ids), force_order=True)
+
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        self._async_check_room_changes()
+        super()._handle_coordinator_update()
+
+    @callback
+    def _async_check_room_changes(self) -> None:
+        """Ask the user to remap areas if the vacuum's rooms were added or removed."""
+        if (
+            VacuumEntityFeature.CLEAN_AREA not in self.supported_features
+            or self.registry_entry is None
+            or not self.coordinator.rooms
+        ):
+            return
+        last_seen = self.last_seen_segments
+        if last_seen is None:
+            return  # The user has not mapped areas yet.
+        previous = tuple(sorted(segment.id for segment in last_seen))
+        if previous == tuple(sorted(self.coordinator.rooms)) or previous == self._segments_issue_for:
+            return
+        self._segments_issue_for = previous
+        self.async_create_segments_issue()
 
     async def async_force_refresh(self) -> None:
         """Force refresh status and room data."""

@@ -1,7 +1,7 @@
 {
   "domain": "switchbot_vacuum",
   "name": "SwitchBot Vacuum",
-  "version": "0.6.4",
+  "version": "0.7.0",
   "documentation": "https://github.com/yostinso/switchbot-vacuum",
   "issue_tracker": "https://github.com/yostinso/switchbot-vacuum/issues",
   "codeowners": [
