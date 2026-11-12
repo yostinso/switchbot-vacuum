@@ -329,7 +329,7 @@ The **Map** image entity is now created for K10+ as well. It decodes the map pac
 
 - If the current map object has expired (the robot stores it for one day), the permanent recorded map for the same map ID is used instead.
 - The robot's reported `CurrentLocation` is drawn as an orange marker with a heading line whenever it changes. Heading units have not been confirmed on hardware.
-- The last cleaning path (from the robot's `GetCleanTrackWithPosIdx` service) is drawn in green. It is loaded once per map and followed incrementally while the robot is cleaning, paused or returning. Gaps over 1 m are not joined.
+- The last cleaning path (from the robot's `GetCleanTrackWithPosIdx` service) is drawn in green. It is loaded once per map and followed incrementally while the robot is cleaning, paused or returning. While the robot is cleaning or returning, the integration polls every 15 seconds instead of 30. Gaps over 1 m are not joined.
 - The image is rotated 180° from the raw grid to match the SwitchBot app.
 - Attributes: `rooms` (pixel `outline`, `outline_vacuum` in robot millimetres, label `x`/`y`), `charger`, `charger_position`, `vacuum_position`, `calibration_points`, and `coordinate_fit`.
 - `calibration_points` and `vacuum_position` follow the conventions of [xiaomi-vacuum-map-card](https://github.com/PiotrMachowski/lovelace-xiaomi-vacuum-map-card), so the image can be used as that card's map with `calibration_source: {entity: image.<your_map>}`. Use `outline_vacuum` for room outlines in its `predefined_selections`, and call `switchbot_vacuum.clean_rooms` from its service templates.

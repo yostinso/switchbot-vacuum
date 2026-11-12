@@ -2,6 +2,7 @@
 
 import sys
 import time
+from datetime import timedelta
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -309,6 +310,7 @@ class K10EntityTests(unittest.IsolatedAsyncioTestCase):
     async def test_status_reads_actual_mop_property(self):
         coordinator = object.__new__(coordinator_module.SwitchBotS10Coordinator)
         coordinator.hass = MagicMock()
+        coordinator.update_interval = timedelta(seconds=30)
         coordinator.wonderlab_endpoint = "https://wonderlabs.eu.api.switchbot.net"
         coordinator._last_room_refresh = time.time()
         coordinator._rooms = {}

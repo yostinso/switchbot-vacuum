@@ -7,6 +7,7 @@ import base64
 import json
 import struct
 import sys
+from datetime import timedelta
 import unittest
 import zlib
 from pathlib import Path
@@ -416,6 +417,14 @@ class RenderTests(unittest.TestCase):
         raw = zlib.decompress(png[41 : 41 + idat_len])
         self.assertEqual(len(raw), height * (1 + width * 4))
 
+    def test_room_fill_stats(self):
+        stats = k10_map.decode_k10_map(k10_map_record())["_room_stats"]["rooms"]
+        self.assertEqual(len(stats), 2)
+        for room in stats:
+            self.assertGreater(room["cells_coloured"], 0)
+            self.assertLessEqual(room["cells_coloured"], room["cells_inside"])
+            self.assertIn("127", room["grid_values_inside"])
+
     def test_rotation_flips_both_axes(self):
         rendered = k10_map.decode_k10_map(k10_map_record())
         frame = k10_map._Frame(*rendered["_frame"])
@@ -538,6 +547,7 @@ def fake_coordinator(**extra):
     coordinator.k10_map_summary = None
     coordinator.k10_property_shapes = {}
     coordinator.k10_last_error = None
+    coordinator.update_interval = timedelta(seconds=30)
     coordinator.data = {}
     for key, value in extra.items():
         setattr(coordinator, key, value)
@@ -604,6 +614,19 @@ class CoordinatorTests(unittest.IsolatedAsyncioTestCase):
         await coordinator._async_update_k10_overlay(None)
         self.assertTrue(coordinator.map_data["attributes"]["route_available"] is False)
         self.assertEqual(coordinator.map_data["attributes"]["route_points"], 1)
+
+    async def test_polls_faster_while_moving(self):
+        from datetime import timedelta
+
+        coordinator = fake_coordinator(_last_room_refresh=10**12,
+                                       update_interval=timedelta(seconds=30))
+        coordinator.async_get_k10_status = AsyncMock(return_value={})
+        client = MagicMock()
+        coordinator._authorize_k10_api = AsyncMock(return_value=client)
+        for status, seconds in ((1, 15), (4, 30), (5, 15), (7, 30)):
+            client.get_properties = AsyncMock(return_value={"WorkingStatus": status})
+            await coordinator._async_update_data_k10()
+            self.assertEqual(coordinator.update_interval, timedelta(seconds=seconds), status)
 
     async def test_track_error_does_not_retry_every_poll(self):
         coordinator = fake_coordinator(map_data=k10_map.decode_k10_map(k10_map_record()))

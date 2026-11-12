@@ -59,6 +59,9 @@ from .k10_map import decode_k10_map, describe_map, parse_path, parse_pose, rende
 
 # Cleaning, cleaning variants, paused and returning to the dock (const.py K10 statuses).
 K10_TRACK_ACTIVE_STATUSES = frozenset({1, 2, 3, 4, 5})
+# Cleaning and returning to the dock (not paused): poll faster to follow the path.
+K10_MOVING_STATUSES = frozenset({1, 2, 3, 5})
+K10_ACTIVE_UPDATE_SECONDS = 15
 from .route_data import download_route, render_position
 
 _LOGGER = logging.getLogger(__name__)
@@ -142,6 +145,7 @@ def _render_k10_map(
         _LOGGER.warning("K10+ map could not be rendered (%s)", type(exc).__name__)
         return None, summary
     summary["coordinate_fit"] = rendered["attributes"]["coordinate_fit"]
+    summary["room_fill"] = rendered.get("_room_stats")
     return rendered, summary
 
 
@@ -970,9 +974,15 @@ class SwitchBotS10Coordinator(DataUpdateCoordinator):
             if marker and self._k10_map_marker not in (None, marker):
                 self._last_room_refresh = 0
             self._k10_map_marker = marker or self._k10_map_marker
-            await self._async_update_k10_track(
-                properties.get("WorkingStatus", status.get("WorkingStatus"))
-            )
+            working_status = properties.get("WorkingStatus", status.get("WorkingStatus"))
+            # Follow the path more closely while the robot is moving.
+            interval = timedelta(seconds=(
+                K10_ACTIVE_UPDATE_SECONDS if working_status in K10_MOVING_STATUSES
+                else UPDATE_INTERVAL_SECONDS
+            ))
+            if self.update_interval != interval:
+                self.update_interval = interval
+            await self._async_update_k10_track(working_status)
             await self._async_update_k10_overlay(properties.get("CurrentLocation"))
         mode = next((name for name, value in CLEAN_MODES.items()
                      if value == properties.get("MopModeSwitching")), None)

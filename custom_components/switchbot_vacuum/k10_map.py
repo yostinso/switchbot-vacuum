@@ -316,16 +316,30 @@ def decode_k10_map(map_data: dict[str, Any]) -> dict[str, Any]:
         return [round(px, 1), round(py, 1)]
 
     geometry = {}
+    room_stats = []
     for index, room in enumerate(rooms):
         if len(room["vertexs"]) < 3:
+            room_stats.append({"vertices": len(room["vertexs"]), "skipped": True})
             continue
         polygon = [crop_cell(x, y) for x, y in room["vertexs"]]
         color = (*ROOM_COLORS[index % len(ROOM_COLORS)], 255)
         interior = []
+        under: Counter = Counter()
         for col, row in _fill_polygon(polygon, cw, ch):
+            under[grid[(height - 1 - (top + row)) * width + left + col]] += 1
             if floor[row][col]:
                 cells[row][col] = color
                 interior.append((col + 0.5, row + 0.5))
+        room_stats.append({
+            "vertices": len(polygon),
+            "crop_bbox": [
+                round(min(p[0] for p in polygon), 1), round(min(p[1] for p in polygon), 1),
+                round(max(p[0] for p in polygon), 1), round(max(p[1] for p in polygon), 1),
+            ],
+            "cells_inside": sum(under.values()),
+            "cells_coloured": len(interior),
+            "grid_values_inside": {str(v): c for v, c in under.most_common(5)},
+        })
         cx = sum(p[0] for p in polygon) / len(polygon)
         cy = sum(p[1] for p in polygon) / len(polygon)
         if interior:  # Label on a cleaned cell nearest the vertex centroid.
@@ -383,6 +397,7 @@ def decode_k10_map(map_data: dict[str, Any]) -> dict[str, Any]:
         "_base_image": base_image,
         "_render_rows": [bytes(r) for r in pixel_rows],
         "_frame": frame.as_tuple(),
+        "_room_stats": {"crop_size": [cw, ch], "rooms": room_stats},
         "rooms": room_names,
         "image": base_image,
         "attributes": attributes,
