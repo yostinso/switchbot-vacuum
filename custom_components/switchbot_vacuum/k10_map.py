@@ -24,6 +24,8 @@ from typing import Any
 MAX_CELLS = 4_000_000
 MAX_IMAGE_EDGE = 1600
 MARGIN_CELLS = 3
+# The SwitchBot app shows K10+ maps rotated 180° relative to the raw grid (verified on hardware).
+ROTATION = 180
 UNKNOWN = 0
 
 C_FLOOR = (236, 240, 245, 255)
@@ -32,6 +34,7 @@ C_UNKNOWN = (0, 0, 0, 0)
 C_NOGO = (224, 74, 74)
 C_DOCK = (30, 120, 210)
 C_ROBOT = (235, 126, 24)
+C_PATH = (46, 160, 90, 200)  # RGBA; alpha is the blend weight over the floor.
 ROOM_COLORS = (
     (192, 217, 246),
     (225, 206, 241),
@@ -137,10 +140,20 @@ def _smart_area(map_data: dict[str, Any]) -> dict[str, Any]:
 
 
 def _points(value: Any) -> list[tuple[float, float]]:
-    if not isinstance(value, list):
+    """Accept [[x, y], ...], [x1, y1, x2, y2, ...], [{x, y}, ...] or a JSON string."""
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except ValueError:
+            return []
+    if not isinstance(value, (list, tuple)):
         return []
+    if value and all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in value):
+        value = [value[i : i + 2] for i in range(0, len(value) - 1, 2)]
     points = []
     for p in value:
+        if isinstance(p, dict):
+            p = [p.get("x", p.get("X")), p.get("y", p.get("Y"))]
         if isinstance(p, (list, tuple)) and len(p) >= 2:
             try:
                 x, y = float(p[0]), float(p[1])
@@ -152,22 +165,37 @@ def _points(value: Any) -> list[tuple[float, float]]:
 
 
 class _Frame:
-    """World (vertex units) <-> grid cell <-> cropped, scaled image pixels."""
+    """World (vertex units) <-> grid cell <-> cropped, scaled, rotated image pixels."""
 
-    def __init__(self, x_min, y_min, res, height, factor, crop, scale):
+    def __init__(self, x_min, y_min, res, height, factor, crop, scale, rotation=0):
         self.x_min, self.y_min, self.res = x_min, y_min, res
         self.height, self.factor, self.scale = height, factor, scale
         self.left, self.top, self.right, self.bottom = crop  # top-origin rows
+        self.rotation = rotation
+        self.image_w = (self.right - self.left + 1) * scale
+        self.image_h = (self.bottom - self.top + 1) * scale
 
     def cell(self, x: float, y: float) -> tuple[float, float]:
         """Continuous grid coordinates, rows counted from the bottom."""
         return (x / self.factor - self.x_min) / self.res, (y / self.factor - self.y_min) / self.res
 
-    def pixel(self, x: float, y: float) -> tuple[float, float]:
+    def crop(self, x: float, y: float) -> tuple[float, float]:
+        """Unrotated, unscaled crop-space coordinates (rows from the top)."""
         cx, cy = self.cell(x, y)
-        return (cx - self.left) * self.scale, (self.height - cy - self.top) * self.scale
+        return cx - self.left, self.height - cy - self.top
+
+    def to_pixel(self, ccx: float, ccy: float) -> tuple[float, float]:
+        px, py = ccx * self.scale, ccy * self.scale
+        if self.rotation == 180:
+            return self.image_w - px, self.image_h - py
+        return px, py
+
+    def pixel(self, x: float, y: float) -> tuple[float, float]:
+        return self.to_pixel(*self.crop(x, y))
 
     def world(self, px: float, py: float) -> tuple[float, float]:
+        if self.rotation == 180:
+            px, py = self.image_w - px, self.image_h - py
         cx = px / self.scale + self.left
         cy = self.height - (py / self.scale + self.top)
         return (cx * self.res + self.x_min) * self.factor, (cy * self.res + self.y_min) * self.factor
@@ -175,7 +203,7 @@ class _Frame:
     def as_tuple(self) -> tuple:
         return (
             self.x_min, self.y_min, self.res, self.height, self.factor,
-            (self.left, self.top, self.right, self.bottom), self.scale,
+            (self.left, self.top, self.right, self.bottom), self.scale, self.rotation,
         )
 
 
@@ -262,7 +290,9 @@ def decode_k10_map(map_data: dict[str, Any]) -> dict[str, Any]:
         bottom = min(height - 1, max(rows_known) + MARGIN_CELLS)
     cw, ch = right - left + 1, bottom - top + 1
     scale = max(1, min(4, MAX_IMAGE_EDGE // max(cw, ch)))
-    frame = _Frame(x_min, y_min, res, height, factor, (left, top, right, bottom), scale)
+    frame = _Frame(
+        x_min, y_min, res, height, factor, (left, top, right, bottom), scale, ROTATION
+    )
 
     # Paint cells, then expand. cell_rgba[row][col] in crop space.
     cells = [[C_UNKNOWN] * cw for _ in range(ch)]
@@ -279,9 +309,11 @@ def decode_k10_map(map_data: dict[str, Any]) -> dict[str, Any]:
                 cells[row][col] = C_FLOOR
                 floor[row][col] = True
 
-    def crop_cell(x: float, y: float) -> tuple[float, float]:
-        cx, cy = frame.cell(x, y)
-        return cx - left, height - cy - top
+    crop_cell = frame.crop
+
+    def to_pixel(ccx: float, ccy: float) -> list[float]:
+        px, py = frame.to_pixel(ccx, ccy)
+        return [round(px, 1), round(py, 1)]
 
     geometry = {}
     for index, room in enumerate(rooms):
@@ -300,10 +332,10 @@ def decode_k10_map(map_data: dict[str, Any]) -> dict[str, Any]:
             cx, cy = min(interior, key=lambda p: (p[0] - cx) ** 2 + (p[1] - cy) ** 2)
         geometry[f"room{room['id']}"] = {
             "name": room["name"],
-            "outline": [[round(x * scale, 1), round(y * scale, 1)] for x, y in polygon],
+            "outline": [to_pixel(x, y) for x, y in polygon],
             "outline_vacuum": [[round(x), round(y)] for x, y in room["vertexs"]],
-            "x": round(cx * scale, 1),
-            "y": round(cy * scale, 1),
+            "x": to_pixel(cx, cy)[0],
+            "y": to_pixel(cx, cy)[1],
         }
 
     for zone in map_data.get("area") or []:
@@ -316,9 +348,10 @@ def decode_k10_map(map_data: dict[str, Any]) -> dict[str, Any]:
                         (b * 3 + n * 2) // 5 for b, n in zip(base[:3], C_NOGO)
                     ) + (255,)
 
-    image_w, image_h = cw * scale, ch * scale
+    image_w, image_h = frame.image_w, frame.image_h
     pixel_rows = []
-    for row in cells:
+    for row in (cells[::-1] if ROTATION == 180 else cells):
+        row = row[::-1] if ROTATION == 180 else row
         expanded = b"".join(bytes(c) * scale for c in row)
         pixel_rows.extend(bytearray(expanded) for _ in range(scale))
 
@@ -383,23 +416,81 @@ def parse_pose(value: Any) -> tuple[float, float, float] | None:
     return pose if all(math.isfinite(v) for v in pose) else None
 
 
-def render_k10_position(map_data: dict[str, Any], pose: tuple[float, float, float]) -> dict:
-    """Draw the robot on a copy of the cached pixels."""
+def parse_path(value: Any) -> list[tuple[float, float]]:
+    """Track points ``[[x, y, ...], ...]`` in robot units; tolerant like rooms."""
+    return _points(value)
+
+
+def _draw_path(rows, frame: _Frame, path: list[tuple[float, float]]) -> int:
+    """Blend the cleaning path onto the pixels; return the number of segments drawn."""
+    width, height = frame.image_w, frame.image_h
+    half = max(0.5, frame.scale / 4)
+    max_jump = 1.0 * frame.factor  # Skip gaps over 1 m (relocalisation, missing samples).
+    drawn = 0
+    painted: set[tuple[int, int]] = set()
+    for (ax, ay), (bx, by) in zip(path, path[1:]):
+        if math.hypot(bx - ax, by - ay) > max_jump:
+            continue
+        x0, y0 = frame.pixel(ax, ay)
+        x1, y1 = frame.pixel(bx, by)
+        steps = max(1, int(math.hypot(x1 - x0, y1 - y0) * 2))
+        for i in range(steps + 1):
+            x = x0 + (x1 - x0) * i / steps
+            y = y0 + (y1 - y0) * i / steps
+            for yy in range(int(y - half), int(y + half) + 1):
+                for xx in range(int(x - half), int(x + half) + 1):
+                    if 0 <= xx < width and 0 <= yy < height:
+                        painted.add((xx, yy))
+        drawn += 1
+    r, g, b, a = C_PATH
+    for xx, yy in painted:
+        px = rows[yy][xx * 4 : xx * 4 + 4]
+        if px[3]:
+            rows[yy][xx * 4 : xx * 4 + 4] = bytes((
+                (px[0] * (255 - a) + r * a) // 255,
+                (px[1] * (255 - a) + g * a) // 255,
+                (px[2] * (255 - a) + b * a) // 255,
+                255,
+            ))
+    return drawn
+
+
+def render_k10_overlay(
+    map_data: dict[str, Any],
+    pose: tuple[float, float, float] | None = None,
+    path: list[tuple[float, float]] | None = None,
+) -> dict:
+    """Draw the last cleaning path and the robot on a copy of the cached pixels."""
     frame = _Frame(*map_data["_frame"])
-    width, height = map_data["attributes"]["width"], map_data["attributes"]["height"]
-    x, y = frame.pixel(pose[0], pose[1])
-    if not (0 <= x < width and 0 <= y < height):
-        raise ValueError("Pose outside map")
+    width, height = frame.image_w, frame.image_h
     rows = [bytearray(r) for r in map_data["_render_rows"]]
-    radius = max(6, frame.scale * 2.5)
-    _disc(rows, width, height, x, y, radius, C_ROBOT, (255, 255, 255))
-    # Heading: 360 robots report degrees, counter-clockwise; image y points down.
-    angle = math.radians(pose[2]) if abs(pose[2]) > 2 * math.pi + 0.01 else pose[2]
-    for i in range(int(radius * 1.8)):
-        xx, yy = round(x + math.cos(angle) * i), round(y - math.sin(angle) * i)
-        if 0 <= xx < width and 0 <= yy < height:
-            rows[yy][xx * 4 : xx * 4 + 4] = bytes((120, 54, 5, 255))
-    return {"image": _png_rgba(width, height, rows), "pixel": {"x": round(x, 1), "y": round(y, 1)}}
+    result: dict[str, Any] = {"pixel": None, "path_segments": 0}
+    if path:
+        result["path_segments"] = _draw_path(rows, frame, path)
+    if pose is not None:
+        x, y = frame.pixel(pose[0], pose[1])
+        if not (0 <= x < width and 0 <= y < height):
+            raise ValueError("Pose outside map")
+        radius = max(6, frame.scale * 2.5)
+        _disc(rows, width, height, x, y, radius, C_ROBOT, (255, 255, 255))
+        # Heading: degrees (or radians if small), counter-clockwise in the robot frame.
+        angle = math.radians(pose[2]) if abs(pose[2]) > 2 * math.pi + 0.01 else pose[2]
+        step = frame.res * frame.factor
+        tx, ty = frame.pixel(pose[0] + math.cos(angle) * step, pose[1] + math.sin(angle) * step)
+        norm = math.hypot(tx - x, ty - y) or 1
+        dx, dy = (tx - x) / norm, (ty - y) / norm
+        for i in range(int(radius * 1.8)):
+            xx, yy = round(x + dx * i), round(y + dy * i)
+            if 0 <= xx < width and 0 <= yy < height:
+                rows[yy][xx * 4 : xx * 4 + 4] = bytes((120, 54, 5, 255))
+        result["pixel"] = {"x": round(x, 1), "y": round(y, 1)}
+    result["image"] = _png_rgba(width, height, rows)
+    return result
+
+
+def render_k10_position(map_data: dict[str, Any], pose: tuple[float, float, float]) -> dict:
+    """Draw only the robot (kept for callers without a path)."""
+    return render_k10_overlay(map_data, pose)
 
 
 def describe_map(map_data: dict[str, Any], record_count: int = 0) -> dict[str, Any]:

@@ -265,6 +265,7 @@ class K10Api:
         self.map_record_count = 0
         self.map_inventory: dict[str, Any] | None = None
         self.map_attempts: list[dict[str, Any]] = []
+        self.track_shape: dict[str, Any] | None = None
         self.lock = asyncio.Lock()
 
     @property
@@ -390,6 +391,46 @@ class K10Api:
             if properties.get("WorkingStatus") not in (6, 7):
                 raise K10ProtocolError("Dock the K10+ before emptying its dustbin")
             await self.invoke_service(session, "StartCollectingDust", {})
+
+    async def get_clean_track(
+        self, session: ClientSession, start: int = 0, max_points: int = 20000
+    ) -> tuple[list[Any], int]:
+        """Read the current or last cleaning track from ``start``; read-only.
+
+        Returns (points, total). Points are ``[x, y, ...]`` in robot units.
+        """
+        points: list[Any] = []
+        index, total = start, start
+        for _ in range(50):
+            result = await self.request(
+                session, "/v1/iot/device/invoke_service",
+                form={
+                    "product_key": self.product_key,
+                    "device_name": self.device_mac,
+                    "identifier": "GetCleanTrackWithPosIdx",
+                    "input": json.dumps({"StartPosIndex": index}, separators=(",", ":")),
+                },
+            )
+            if result.get("code") != 0:
+                raise K10ProtocolError(f"Cannot read cleaning track (code {result.get('code')})")
+            raw = (result.get("data") or {}).get("result")
+            outer = json.loads(raw) if isinstance(raw, str) and raw else (raw or {})
+            track = outer.get("Track", outer) if isinstance(outer, dict) else {}
+            track = json.loads(track) if isinstance(track, str) and track else (track or {})
+            if not isinstance(track, dict):
+                raise K10ProtocolError("Invalid cleaning track response")
+            self.track_shape = {"outer_keys": sorted(outer)[:20], "track_keys": sorted(track)[:20]}
+            segment = track.get("posArray") or track.get("PosArray") or []
+            reported = track.get("totalPoints", track.get("TotalPoints"))
+            if not isinstance(segment, list) or not segment:
+                total = int(reported) if isinstance(reported, int) else index
+                break
+            points.extend(segment)
+            index += len(segment)
+            total = int(reported) if isinstance(reported, int) else index
+            if index >= total or len(points) >= max_points:
+                break
+        return points, total
 
     async def _download_package(
         self, session: ClientSession, url: str, attempt: dict[str, Any]

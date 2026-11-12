@@ -90,6 +90,15 @@ def k10_map_record(*, vertex_scale=1.0) -> dict:
     }
 
 
+def render_rows(png: bytes) -> list[bytes]:
+    """Decode our own unfiltered RGBA PNGs back into rows."""
+    width, height = struct.unpack(">2I", png[16:24])
+    idat_len = struct.unpack(">I", png[33:37])[0]
+    raw = zlib.decompress(png[41 : 41 + idat_len])
+    stride = 1 + width * 4
+    return [raw[r * stride + 1 : (r + 1) * stride] for r in range(height)]
+
+
 def pixel(rendered, x, y):
     row = rendered["_render_rows"][int(y)]
     return tuple(row[int(x) * 4 : int(x) * 4 + 4])
@@ -296,6 +305,37 @@ class MapDownloadTests(unittest.IsolatedAsyncioTestCase):
             await client.get_map(Session())
 
 
+def track_page(points, total):
+    track = json.dumps({"posArray": points, "totalPoints": total})
+    return {"code": 0, "data": {"result": json.dumps({"Track": track})}}
+
+
+class TrackTests(unittest.IsolatedAsyncioTestCase):
+    async def test_track_paginates_from_start_index(self):
+        client = api.K10Api("example-device", "example-product", "installation")
+        client.request = AsyncMock(side_effect=[
+            track_page([[1, 2], [3, 4]], 3), track_page([[5, 6]], 3),
+        ])
+        points, total = await client.get_clean_track(Session())
+        self.assertEqual((points, total), ([[1, 2], [3, 4], [5, 6]], 3))
+        inputs = [json.loads(c.kwargs["form"]["input"]) for c in client.request.await_args_list]
+        self.assertEqual(inputs, [{"StartPosIndex": 0}, {"StartPosIndex": 2}])
+        self.assertEqual(client.request.await_args_list[0].args[1], "/v1/iot/device/invoke_service")
+        self.assertEqual(client.request.await_args_list[0].kwargs["form"]["identifier"],
+                         "GetCleanTrackWithPosIdx")
+
+    async def test_empty_track(self):
+        client = api.K10Api("example-device", "example-product", "installation")
+        client.request = AsyncMock(return_value=track_page([], 0))
+        self.assertEqual(await client.get_clean_track(Session(), 0), ([], 0))
+
+    async def test_rejected_track(self):
+        client = api.K10Api("example-device", "example-product", "installation")
+        client.request = AsyncMock(return_value={"code": 1004})
+        with self.assertRaisesRegex(api.K10ProtocolError, "1004"):
+            await client.get_clean_track(Session())
+
+
 class PackageTests(unittest.TestCase):
     def test_single_object(self):
         self.assertEqual(api.parse_package(b'{"a": 1}'), [{"a": 1}])
@@ -366,7 +406,9 @@ class RenderTests(unittest.TestCase):
         kitchen, den = attrs["rooms"]["room1"], attrs["rooms"]["room2"]
         self.assertEqual(pixel(rendered, kitchen["x"], kitchen["y"])[:3], k10_map.ROOM_COLORS[0])
         self.assertEqual(pixel(rendered, den["x"], den["y"])[:3], k10_map.ROOM_COLORS[1])
-        self.assertLess(kitchen["x"], den["x"])  # x is not mirrored
+        # Rotated 180° like the app: the west room is drawn on the right.
+        self.assertEqual(k10_map.ROTATION, 180)
+        self.assertGreater(kitchen["x"], den["x"])
         # Unknown cells are transparent.
         self.assertEqual(pixel(rendered, 0, 0)[3], 0)
         # IDAT inflates to the expected size.
@@ -374,12 +416,14 @@ class RenderTests(unittest.TestCase):
         raw = zlib.decompress(png[41 : 41 + idat_len])
         self.assertEqual(len(raw), height * (1 + width * 4))
 
-    def test_y_axis_points_up_in_world(self):
+    def test_rotation_flips_both_axes(self):
         rendered = k10_map.decode_k10_map(k10_map_record())
         frame = k10_map._Frame(*rendered["_frame"])
         low = frame.pixel(*mm(10, 8))
         high = frame.pixel(*mm(10, 20))
-        self.assertGreater(low[1], high[1])
+        self.assertLess(low[1], high[1])
+        west, east = frame.pixel(*mm(10, 10)), frame.pixel(*mm(30, 10))
+        self.assertGreater(west[0], east[0])
 
     def test_calibration_points_round_trip(self):
         rendered = k10_map.decode_k10_map(k10_map_record())
@@ -408,6 +452,52 @@ class RenderTests(unittest.TestCase):
         self.assertAlmostEqual(result["pixel"]["x"], frame.pixel(x, y)[0], places=0)
         with self.assertRaises(ValueError):
             k10_map.render_k10_position(rendered, (999999, 999999, 0))
+
+    def test_heading_follows_rotation(self):
+        rendered = k10_map.decode_k10_map(k10_map_record())
+        x, y = mm(15, 15)
+        result = k10_map.render_k10_overlay(rendered, (x, y, 0))  # facing world +x
+        px, py = int(result["pixel"]["x"]), int(result["pixel"]["y"])
+        rows = render_rows(result["image"])
+        heading = (120, 54, 5, 255)
+
+        def at(dx):
+            return tuple(rows[py][(px + dx) * 4 : (px + dx) * 4 + 4])
+
+        # World +x is image -x after the 180° rotation.
+        self.assertEqual(at(-14), heading)
+        self.assertNotEqual(at(14), heading)
+
+    def test_room_vertex_formats(self):
+        expected = [(1.0, 2.0), (3.0, 4.0)]
+        for value in ([[1, 2], [3, 4]], [1, 2, 3, 4], [{"x": 1, "y": 2}, {"x": 3, "y": 4}],
+                      "[[1, 2], [3, 4]]", [[1, 2, 9], [3, 4, 9]]):
+            self.assertEqual(k10_map._points(value), expected, value)
+        self.assertEqual(k10_map._points("garbage"), [])
+
+    def test_flat_room_vertices_are_filled(self):
+        record = k10_map_record()
+        for room in record["smartArea"]["value"]:
+            room["vertexs"] = [v for point in room["vertexs"] for v in point]
+        rendered = k10_map.decode_k10_map(record)
+        kitchen = rendered["attributes"]["rooms"]["room1"]
+        self.assertEqual(pixel(rendered, kitchen["x"], kitchen["y"])[:3], k10_map.ROOM_COLORS[0])
+
+    def test_path_is_drawn_and_gaps_skipped(self):
+        rendered = k10_map.decode_k10_map(k10_map_record())
+        path = [tuple(mm(8, 10)), tuple(mm(18, 10)), tuple(mm(36, 24))]  # 2nd hop 1.14 m
+        result = k10_map.render_k10_overlay(rendered, None, path)
+        self.assertEqual(result["path_segments"], 1)
+        self.assertIsNone(result["pixel"])
+        frame = k10_map._Frame(*rendered["_frame"])
+        mid_x, mid_y = frame.pixel(*mm(13, 10))
+        before = pixel(rendered, mid_x, mid_y)
+        rows = render_rows(result["image"])
+        after = tuple(rows[int(mid_y)][int(mid_x) * 4 : int(mid_x) * 4 + 4])
+        self.assertNotEqual(before, after)
+        gap_x, gap_y = frame.pixel(*mm(24, 15))
+        self.assertEqual(pixel(rendered, gap_x, gap_y),
+                         tuple(rows[int(gap_y)][int(gap_x) * 4 : int(gap_x) * 4 + 4]))
 
     def test_parse_pose(self):
         self.assertEqual(k10_map.parse_pose("[1, 2, 3]"), (1.0, 2.0, 3.0))
@@ -486,13 +576,44 @@ class CoordinatorTests(unittest.IsolatedAsyncioTestCase):
     async def test_position_updates_only_on_change(self):
         coordinator = fake_coordinator(map_data=k10_map.decode_k10_map(k10_map_record()))
         pose = mm(12, 12) + [45]
-        await coordinator._async_update_k10_position(json.dumps(pose))
+        await coordinator._async_update_k10_overlay(json.dumps(pose))
         attrs = coordinator.map_data["attributes"]
         self.assertTrue(attrs["robot_position_available"])
         self.assertEqual(attrs["vacuum_position"], {"x": pose[0], "y": pose[1], "a": 45})
         calls = coordinator.hass.async_add_executor_job.await_count
-        await coordinator._async_update_k10_position(json.dumps(pose))
+        await coordinator._async_update_k10_overlay(json.dumps(pose))
         self.assertEqual(coordinator.hass.async_add_executor_job.await_count, calls)
+
+    async def test_track_full_then_incremental_then_reset(self):
+        coordinator = fake_coordinator(map_data=k10_map.decode_k10_map(k10_map_record()))
+        client = MagicMock()
+        coordinator._k10_api = client
+        a, b, c = mm(8, 10), mm(9, 10), mm(10, 10)
+        client.get_clean_track = AsyncMock(return_value=([a, b], 2))
+        await coordinator._async_update_k10_track(6)  # docked: initial full load
+        self.assertEqual(coordinator._k10_path, [tuple(a), tuple(b)])
+        await coordinator._async_update_k10_track(6)  # docked and loaded: no fetch
+        self.assertEqual(client.get_clean_track.await_count, 1)
+        client.get_clean_track = AsyncMock(return_value=([c], 3))
+        await coordinator._async_update_k10_track(1)  # cleaning: only new points
+        self.assertEqual(client.get_clean_track.await_args.args[1], 2)
+        self.assertEqual(len(coordinator._k10_path), 3)
+        client.get_clean_track = AsyncMock(side_effect=[([], 1), ([a], 1)])
+        await coordinator._async_update_k10_track(1)  # new task: total shrank
+        self.assertEqual(coordinator._k10_path, [tuple(a)])
+        await coordinator._async_update_k10_overlay(None)
+        self.assertTrue(coordinator.map_data["attributes"]["route_available"] is False)
+        self.assertEqual(coordinator.map_data["attributes"]["route_points"], 1)
+
+    async def test_track_error_does_not_retry_every_poll(self):
+        coordinator = fake_coordinator(map_data=k10_map.decode_k10_map(k10_map_record()))
+        coordinator._k10_api = MagicMock()
+        coordinator._k10_api.get_clean_track = AsyncMock(
+            side_effect=api.K10ProtocolError("Cannot read cleaning track (code 1004)"))
+        await coordinator._async_update_k10_track(6)
+        await coordinator._async_update_k10_track(6)
+        self.assertEqual(coordinator._k10_api.get_clean_track.await_count, 1)
+        self.assertIn("1004", coordinator.k10_track_error)
 
     async def test_status_poll_triggers_map_refresh_on_new_upload(self):
         coordinator = fake_coordinator(_last_room_refresh=10**12)

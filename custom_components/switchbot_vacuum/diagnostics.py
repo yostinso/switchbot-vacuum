@@ -28,7 +28,7 @@ async def async_get_config_entry_diagnostics(
     data = coordinator.data or {}
     return {
         "device_type": entry.data.get("device_type"),
-        "integration_version": "diagnostics-v2",
+        "integration_version": "diagnostics-v3",
         "region": {
             "switchbot_host": urlparse(endpoint).hostname if endpoint else None,
             "botslab_region": botslab_region(endpoint),
@@ -45,6 +45,11 @@ async def async_get_config_entry_diagnostics(
             "map_source": getattr(api, "map_source", None),
             "map_inventory": getattr(api, "map_inventory", None),
             "map_attempts": getattr(api, "map_attempts", None),
+            "track": {
+                "error": getattr(coordinator, "k10_track_error", None),
+                "points": len(getattr(coordinator, "_k10_path", [])),
+                "shape": getattr(api, "track_shape", None),
+            },
             "property_types": getattr(coordinator, "k10_property_shapes", {}),
             "map_summary": getattr(coordinator, "k10_map_summary", None),
         },

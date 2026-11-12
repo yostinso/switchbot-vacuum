@@ -55,7 +55,10 @@ from .const import (
     UPDATE_INTERVAL_SECONDS,
 )
 from .k10_api import CLEAN_MODES, K10Api, K10ProtocolError, botslab_region, room_names
-from .k10_map import decode_k10_map, describe_map, parse_pose, render_k10_position
+from .k10_map import decode_k10_map, describe_map, parse_path, parse_pose, render_k10_overlay
+
+# Cleaning, cleaning variants, paused and returning to the dock (const.py K10 statuses).
+K10_TRACK_ACTIVE_STATUSES = frozenset({1, 2, 3, 4, 5})
 from .route_data import download_route, render_position
 
 _LOGGER = logging.getLogger(__name__)
@@ -171,6 +174,11 @@ class SwitchBotS10Coordinator(DataUpdateCoordinator):
     k10_map_summary: dict[str, Any] | None = None
     k10_property_shapes: dict[str, str] = {}
     k10_last_error: str | None = None
+    k10_track_error: str | None = None
+    _k10_path: list[tuple[float, float]] = []
+    _k10_path_drawn = -1
+    _k10_track_index = 0
+    _k10_track_loaded = False
 
     def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
         """Initialize."""
@@ -507,7 +515,8 @@ class SwitchBotS10Coordinator(DataUpdateCoordinator):
             if rendered is not None:
                 self.map_data = rendered
                 self.map_updated = datetime.now().astimezone()
-                self._k10_pose = None
+                self._k10_pose, self._k10_path_drawn = None, -1
+                self._k10_track_loaded = False  # Reload the track for the new map.
                 _LOGGER.info(
                     "Rendered K10+ map (%s rooms, fit %s)", len(rendered["rooms"]),
                     rendered["attributes"]["coordinate_fit"],
@@ -869,34 +878,70 @@ class SwitchBotS10Coordinator(DataUpdateCoordinator):
         if not self.access_token or time.time() >= self._token_expiry:
             await self.async_login()
 
-    async def _async_update_k10_position(self, raw: Any) -> None:
-        """Overlay the robot's reported location when it changes."""
-        pose = parse_pose(raw)
+    async def _async_update_k10_track(self, working_status: Any) -> None:
+        """Load the whole last track once per map, then only new points while active."""
+        api = getattr(self, "_k10_api", None)
+        if api is None or getattr(self, "map_data", None) is None:
+            return
+        active = working_status in K10_TRACK_ACTIVE_STATUSES
+        if self._k10_track_loaded and not active:
+            return
+        start = self._k10_track_index if self._k10_track_loaded else 0
+        try:
+            session = async_get_clientsession(self.hass)
+            points, total = await api.get_clean_track(session, start)
+            if start and total < start:  # A new task restarted the track.
+                start = 0
+                points, total = await api.get_clean_track(session, 0)
+            self.k10_track_error = None
+        except K10ProtocolError as exc:
+            self.k10_track_error = str(exc)
+            self._k10_track_loaded = True  # Retry after the next map refresh, not every poll.
+            _LOGGER.debug("K10+ cleaning track unavailable: %s", exc)
+            return
+        except (aiohttp.ClientError, TimeoutError, ValueError, KeyError, TypeError) as exc:
+            self.k10_track_error = type(exc).__name__
+            _LOGGER.debug("K10+ cleaning track unavailable (%s)", type(exc).__name__)
+            return
+        new_points = parse_path(points)
+        self._k10_path = (self._k10_path if start else []) + new_points
+        self._k10_track_index = start + len(points)
+        self._k10_track_loaded = True
+
+    async def _async_update_k10_overlay(self, raw_pose: Any) -> None:
+        """Redraw the path and robot when either changes."""
+        pose = parse_pose(raw_pose)
         snapshot = getattr(self, "map_data", None)
-        if snapshot is None or "_frame" not in snapshot or pose is None or pose == self._k10_pose:
+        path = self._k10_path
+        if snapshot is None or "_frame" not in snapshot:
+            return
+        if pose == self._k10_pose and len(path) == self._k10_path_drawn:
             return
         try:
             rendered = await self.hass.async_add_executor_job(
-                render_k10_position, snapshot, pose
+                render_k10_overlay, snapshot, pose, path
             )
         except (ValueError, KeyError, TypeError, IndexError) as exc:
-            _LOGGER.debug("K10+ position not drawn (%s)", type(exc).__name__)
+            _LOGGER.debug("K10+ overlay not drawn (%s)", type(exc).__name__)
             return
         if self.map_data is not snapshot:
             return  # A map refresh replaced these pixels meanwhile.
-        self._k10_pose = pose
+        self._k10_pose, self._k10_path_drawn = pose, len(path)
         now = datetime.now().astimezone()
-        self.map_data = snapshot | {
-            "image": rendered["image"],
-            "attributes": snapshot["attributes"] | {
+        attributes = snapshot["attributes"] | {
+            "route_available": bool(rendered["path_segments"]),
+            "route_points": len(path),
+        }
+        if rendered["pixel"] is not None:
+            attributes |= {
                 "robot_position_available": True,
                 "robot_position": {
                     "kind": "reported", "received_at": now.isoformat(),
                     "x": pose[0], "y": pose[1], "heading": pose[2], "pixel": rendered["pixel"],
                 },
                 "vacuum_position": {"x": pose[0], "y": pose[1], "a": pose[2]},
-            },
-        }
+            }
+        self.map_data = snapshot | {"image": rendered["image"], "attributes": attributes}
         self.map_updated = now
 
     async def _async_update_data_k10(self) -> dict[str, Any]:
@@ -925,7 +970,10 @@ class SwitchBotS10Coordinator(DataUpdateCoordinator):
             if marker and self._k10_map_marker not in (None, marker):
                 self._last_room_refresh = 0
             self._k10_map_marker = marker or self._k10_map_marker
-            await self._async_update_k10_position(properties.get("CurrentLocation"))
+            await self._async_update_k10_track(
+                properties.get("WorkingStatus", status.get("WorkingStatus"))
+            )
+            await self._async_update_k10_overlay(properties.get("CurrentLocation"))
         mode = next((name for name, value in CLEAN_MODES.items()
                      if value == properties.get("MopModeSwitching")), None)
 
