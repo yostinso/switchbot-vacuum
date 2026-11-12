@@ -1,9 +1,9 @@
 {
   "domain": "switchbot_vacuum",
   "name": "SwitchBot Vacuum",
-  "version": "0.5.0",
-  "documentation": "https://github.com/cgfm/switchbot-vacuum",
-  "issue_tracker": "https://github.com/cgfm/switchbot-vacuum/issues",
+  "version": "0.6.0",
+  "documentation": "https://github.com/yostinso/switchbot-vacuum",
+  "issue_tracker": "https://github.com/yostinso/switchbot-vacuum/issues",
   "codeowners": [
     "@cgfm"
   ],
