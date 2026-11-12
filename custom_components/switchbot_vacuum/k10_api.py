@@ -19,6 +19,7 @@ import json
 import re
 import time
 import uuid
+import zlib
 from typing import TYPE_CHECKING, Any
 from urllib.parse import quote, urlparse
 
@@ -66,6 +67,39 @@ def trusted_storage_url(url: str, region: str) -> bool:
         and host.endswith(_STORAGE_SUFFIXES)
         and host.split(".", 1)[0].startswith(f"{region}-")
     )
+
+
+MAX_PACKAGE_BYTES = 64 * 1024 * 1024
+
+
+def unwrap_package(raw: bytes) -> tuple[bytes, str]:
+    """Remove a gzip, zlib or zip wrapper (bounded); return (bytes, wrapper)."""
+    if raw.startswith(b"PK\x03\x04"):
+        import io
+        import zipfile
+
+        with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+            members = [m for m in archive.infolist() if not m.is_dir()]
+            if not members or sum(m.file_size for m in members) > MAX_PACKAGE_BYTES:
+                raise ValueError("Unusable zip package")
+            # Prefer a JSON-looking member, else the largest.
+            member = max(members, key=lambda m: (m.filename.endswith((".json", ".bin", ".txt")),
+                                                 m.file_size))
+            return archive.read(member), "zip"
+    wrapper = None
+    if raw.startswith(b"\x1f\x8b"):
+        wrapper, wbits = "gzip", 31
+    elif len(raw) >= 2 and raw[0] & 0x0F == 8 and (raw[0] << 8 | raw[1]) % 31 == 0:
+        wrapper, wbits = "zlib", 15
+    if wrapper:
+        inflater = zlib.decompressobj(wbits)
+        out = inflater.decompress(raw, MAX_PACKAGE_BYTES)
+        if inflater.unconsumed_tail:
+            raise ValueError("Package expands beyond the size limit")
+        return out, wrapper
+    if raw.startswith(b"\xef\xbb\xbf"):
+        return raw[3:], "bom"
+    return raw, "none"
 
 
 def parse_package(raw: bytes | str) -> list[dict[str, Any]]:
@@ -229,6 +263,8 @@ class K10Api:
         self.region = "eu1"
         self.map_source: str | None = None
         self.map_record_count = 0
+        self.map_inventory: dict[str, Any] | None = None
+        self.map_attempts: list[dict[str, Any]] = []
         self.lock = asyncio.Lock()
 
     @property
@@ -355,23 +391,51 @@ class K10Api:
                 raise K10ProtocolError("Dock the K10+ before emptying its dustbin")
             await self.invoke_service(session, "StartCollectingDust", {})
 
-    async def _download_package(self, session: ClientSession, url: str) -> dict[str, Any] | None:
-        """Fetch a signed map object; None if it has expired or holds no map."""
+    async def _download_package(
+        self, session: ClientSession, url: str, attempt: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        """Fetch a signed map object; None if it has expired or holds no map.
+
+        ``attempt`` collects a redacted outcome (status, size, format, key names)
+        for diagnostics; the signed URL itself is never recorded.
+        """
         if not trusted_storage_url(url, self.region):
             raise K10ProtocolError("Unexpected signed map destination")
-        async with asyncio.timeout(30), session.get(url, allow_redirects=False) as response:
+        attempt["storage_host"] = urlparse(url).hostname
+        from yarl import URL
+
+        # The URL is already signed and encoded; re-quoting would break the signature.
+        async with (
+            asyncio.timeout(30),
+            session.get(URL(url, encoded=True), allow_redirects=False) as response,
+        ):
+            attempt["status"] = response.status
+            attempt["content_type"] = (getattr(response, "headers", None) or {}).get(
+                "Content-Type"
+            )
             if response.status in (403, 404):
+                attempt["outcome"] = "expired_or_denied"
                 return None  # 1-day objects expire; try the recorded map instead.
             if response.status != 200:
                 raise K10ProtocolError(f"Map storage returned HTTP {response.status}")
             raw = await response.read()
+        attempt["bytes"] = len(raw)
+        attempt["magic"] = raw[:4].hex()
         if len(raw) > 32 * 1024 * 1024:
             raise K10ProtocolError("Map package is too large")
         try:
+            raw, attempt["wrapper"] = unwrap_package(raw)
             records = parse_package(raw)
+        except ValueError as exc:
+            attempt["outcome"] = f"unparsed:{type(exc).__name__}"
+            return None
+        attempt["records"] = [sorted(r)[:40] for r in records[:6]]
+        try:
             map_data = select_map_record(records)
         except ValueError:
+            attempt["outcome"] = "no_map_keys"
             return None
+        attempt["outcome"] = "ok"
         self.map_record_count = len(records)
         return map_data
 
@@ -397,29 +461,55 @@ class K10Api:
 
         map_info = as_dict(properties.get("MapPkgOssInfo"))
         map_id = str(map_info["MapID"]) if map_info.get("MapID") is not None else None
-        candidates: list[tuple[str, str]] = []
+        recorded_list = as_dict(properties.get("RecordedMapList"))
+        recorded_maps = [r for r in recorded_list.get("RecordedMaps") or [] if isinstance(r, dict)]
+        self.map_inventory = {
+            "map_info_keys": sorted(map_info),
+            "map_info_url_signed": map_info.get("Url") in signs,
+            "recorded_list_keys": sorted(recorded_list),
+            "recorded_maps": [
+                {
+                    "keys": sorted(r),
+                    "same_map_id": map_id is not None and str(r.get("MapID")) == map_id,
+                    "signed": [k for k, v in sorted(r.items()) if isinstance(v, str) and v in signs],
+                }
+                for r in recorded_maps[:10]
+            ],
+            "signed_url_count": len(signs),
+        }
+        self.map_attempts = []
+        candidates: list[tuple[str, str, str]] = []
         if map_info.get("Url") in signs:
-            candidates.append(("current", signs[map_info["Url"]]))
-        for recorded in as_dict(properties.get("RecordedMapList")).get("RecordedMaps") or []:
-            if not isinstance(recorded, dict):
+            candidates.append(("current", "MapPkgOssInfo.Url", signs[map_info["Url"]]))
+        # Recorded maps for the current map ID first; other maps only for display.
+        ordered = sorted(
+            recorded_maps, key=lambda r: not (map_id and str(r.get("MapID", map_id)) == map_id)
+        )
+        for recorded in ordered:
+            same = not map_id or str(recorded.get("MapID", map_id)) == map_id
+            if strict and not same:
                 continue
-            if map_id and str(recorded.get("MapID", map_id)) != map_id:
-                continue
-            for key in ("PermSaveUrl", "PermBinSaveUrl"):
+            for key in ("PermBinSaveUrl", "PermSaveUrl"):
                 if recorded.get(key) in signs:
-                    candidates.append(("recorded", signs[recorded[key]]))
+                    candidates.append(
+                        ("recorded" if same else "recorded_other_map", key, signs[recorded[key]])
+                    )
         if not candidates:
             raise K10ProtocolError("The vacuum has not uploaded a map yet")
 
-        for source, url in candidates:
-            map_data = await self._download_package(session, url)
+        for source, key, url in candidates:
+            attempt: dict[str, Any] = {"source": source, "key": key}
+            self.map_attempts.append(attempt)
+            map_data = await self._download_package(session, url, attempt)
             if map_data is None:
                 continue
             if strict and map_id and str(map_data.get("mapId", map_id)) != map_id:
+                attempt["outcome"] = "other_map_id"
                 continue
             if strict and source == "current" and map_data.get("cleanId") != map_info.get("CleanID"):
                 raise K10ProtocolError("Map file and device metadata do not match")
             if strict and "smartArea" not in map_data:
+                attempt["outcome"] = "no_rooms"
                 continue
             self.map_source = source
             return map_data, map_info

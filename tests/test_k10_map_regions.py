@@ -169,7 +169,7 @@ class Session:
 
     def get(self, url, **kwargs):
         self.calls.append(("GET", url, kwargs))
-        status, raw = self.downloads.get(url, (404, b""))
+        status, raw = self.downloads.get(str(url), (404, b""))
         return Response(status=status, raw=raw)
 
 
@@ -235,6 +235,60 @@ class MapDownloadTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(api.K10ProtocolError):
             await client.get_map(session)
 
+    async def test_attempts_are_recorded_without_signatures(self):
+        current = ("https://na1-ali-1days.oss-us-west-1.aliyuncs.com/cur"
+                   "?Expires=1&OSSAccessKeyId=KEYID&Signature=ab%2Bcd%3D")
+        recorded = "https://na1-ali-180days.oss-us-west-1.aliyuncs.com/rec?Signature=SIG2"
+        client = self.client()
+        client.request = AsyncMock(return_value=property_reply(
+            {
+                "MapPkgOssInfo": json.dumps({"Url": "aliyun://cur", "MapID": 101}),
+                "RecordedMapList": json.dumps({"RecordedMaps": [
+                    {"MapID": 101, "PermBinSaveUrl": "aliyun://rec"}]}),
+            },
+            {"aliyun://cur": current, "aliyun://rec": recorded},
+        ))
+        package = zlib.compress(json.dumps(k10_map_record()).encode())
+        session = Session(downloads={current: (404, b""), recorded: (200, package)})
+        await client.get_map(session, strict=False)
+        # The signed URL reaches aiohttp without being re-quoted.
+        self.assertEqual(str(session.calls[0][1]), current)
+        self.assertIn("%2B", str(session.calls[0][1]))
+        attempts = client.map_attempts
+        self.assertEqual([a["outcome"] for a in attempts], ["expired_or_denied", "ok"])
+        self.assertEqual(attempts[1]["wrapper"], "zlib")
+        self.assertEqual(attempts[1]["key"], "PermBinSaveUrl")
+        self.assertEqual(client.map_inventory["recorded_maps"][0]["signed"], ["PermBinSaveUrl"])
+        text = json.dumps([client.map_inventory, attempts])
+        for secret in ("KEYID", "Signature", "SIG2", "aliyun://"):
+            self.assertNotIn(secret, text)
+
+    async def test_unparseable_package_is_described(self):
+        url = "https://na1-ali-1days.oss-us-west-1.aliyuncs.com/cur"
+        client = self.client()
+        client.request = AsyncMock(return_value=property_reply(
+            {"MapPkgOssInfo": {"Url": "u", "MapID": 1}}, {"u": url}))
+        session = Session(downloads={url: (200, b"\x08\x96\x01binary")})
+        with self.assertRaisesRegex(api.K10ProtocolError, "No usable map"):
+            await client.get_map(session, strict=False)
+        attempt = client.map_attempts[0]
+        self.assertEqual(attempt["magic"], "08960162")
+        self.assertTrue(attempt["outcome"].startswith("unparsed:"))
+
+    async def test_display_refresh_may_use_another_recorded_map(self):
+        url = "https://na1-ali-180days.oss-us-west-1.aliyuncs.com/rec"
+        client = self.client()
+        client.request = AsyncMock(return_value=property_reply(
+            {"MapPkgOssInfo": {"MapID": 5},
+             "RecordedMapList": {"RecordedMaps": [{"MapID": 101, "PermSaveUrl": "r"}]}},
+            {"r": url},
+        ))
+        session = Session(downloads={url: (200, json.dumps(k10_map_record()).encode())})
+        await client.get_map(session, strict=False)
+        self.assertEqual(client.map_source, "recorded_other_map")
+        with self.assertRaisesRegex(api.K10ProtocolError, "not uploaded"):
+            await client.get_map(session, strict=True)
+
     async def test_no_uploaded_map(self):
         client = self.client()
         client.request = AsyncMock(return_value=property_reply({}, {}))
@@ -252,6 +306,28 @@ class PackageTests(unittest.TestCase):
         merged = api.select_map_record(api.parse_package(raw.encode()))
         self.assertEqual(merged["width"], 1)
         self.assertEqual(merged["mapId"], 3)
+
+    def test_unwrap_wrappers(self):
+        import gzip
+        import io
+        import zipfile
+
+        body = b'{"a": 1}'
+        archive = io.BytesIO()
+        with zipfile.ZipFile(archive, "w") as z:
+            z.writestr("readme.md", b"x")
+            z.writestr("map.json", body)
+        cases = {
+            "gzip": gzip.compress(body), "zlib": zlib.compress(body),
+            "zip": archive.getvalue(), "bom": b"\xef\xbb\xbf" + body, "none": body,
+        }
+        for wrapper, raw in cases.items():
+            self.assertEqual(api.unwrap_package(raw), (body, wrapper), wrapper)
+
+    def test_unwrap_is_bounded(self):
+        bomb = zlib.compress(b"\0" * (api.MAX_PACKAGE_BYTES + 10))
+        with self.assertRaises(ValueError):
+            api.unwrap_package(bomb)
 
     def test_unrelated_package(self):
         with self.assertRaises(ValueError):
